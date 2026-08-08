@@ -305,6 +305,27 @@ impl RuntimeRegistry {
         Ok(())
     }
 
+    /// Cooperatively stop every provider run that has not reached a terminal
+    /// state. Returns the number of runs signalled.
+    pub async fn cancel_all(&self) -> usize {
+        let mut runs = self.0.write().await;
+        runs.values_mut()
+            .filter(|run| {
+                matches!(
+                    run.snapshot.state,
+                    RunState::Starting
+                        | RunState::Running
+                        | RunState::WaitingApproval
+                        | RunState::Finishing
+                )
+            })
+            .filter_map(|run| run.cancel.take())
+            .map(|cancel| {
+                let _ = cancel.send(());
+            })
+            .count()
+    }
+
     async fn control(&self, run_id: &RunId) -> Result<agent_abstraction::RunControl, RuntimeError> {
         self.0
             .read()

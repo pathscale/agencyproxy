@@ -4,7 +4,7 @@ mod runtime;
 
 use agency_proxy_protocol::{
     Capability, ClientFrame, ClientMessage, ErrorCode, MAX_FRAME_BYTES, PROTOCOL_VERSION, RunId,
-    ServerFrame, ServerResponse,
+    ServerFrame, ServerResponse, ShutdownMode,
 };
 use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_with_max_frame};
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -217,6 +217,39 @@ async fn handle_connection(
                             ServerResponse::Accepted,
                         ).await?;
                         let _ = request_shutdown.send(true);
+                        return Ok(());
+                    }
+                    ClientMessage::Shutdown { mode } => {
+                        let mut lifecycle = lifecycle.lock().await;
+                        if lifecycle.stopping {
+                            send_error(
+                                &mut transport,
+                                frame.request_id,
+                                ErrorCode::Conflict,
+                                "AgencyProxy is already stopping",
+                            ).await?;
+                            continue;
+                        }
+                        // This flag and StartRun share the same lock. Once the
+                        // acknowledgement is visible, no new provider can pass
+                        // the admission gate while existing runs drain.
+                        lifecycle.stopping = true;
+                        send_response(
+                            &mut transport,
+                            frame.request_id,
+                            ServerResponse::Accepted,
+                        ).await?;
+                        drop(lifecycle);
+
+                        tokio::spawn(async move {
+                            if mode == ShutdownMode::Terminate {
+                                registry.cancel_all().await;
+                            }
+                            while registry.active_count().await > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            let _ = request_shutdown.send(true);
+                        });
                         return Ok(());
                     }
                     ClientMessage::StartRun { run_id, request, .. } => {

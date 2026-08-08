@@ -2,7 +2,7 @@ use agency_proxy::ProxyServer;
 use agency_proxy_client::Client;
 use agency_proxy_protocol::{
     ClientFrame, ClientMessage, ErrorCode, MAX_FRAME_BYTES, RunEvent, RunId, RunRequest,
-    ServerFrame, ServerResponse,
+    ServerFrame, ServerResponse, ShutdownMode,
 };
 use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_with_max_frame};
 use futures::{SinkExt, StreamExt};
@@ -140,6 +140,154 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
     assert!(socket.exists(), "refused shutdown keeps serving");
 
     task.abort();
+}
+
+#[tokio::test]
+async fn draining_shutdown_rejects_new_runs_and_waits_for_the_active_run() {
+    let dir = tempdir().expect("temp dir should exist");
+    let binary = dir.path().join("slow-claude");
+    std::fs::write(
+        &binary,
+        r#"#!/bin/sh
+sleep 1
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"proxy-session","usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+    )
+    .expect("fake provider should write");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        .expect("fake provider should be executable");
+
+    let socket = dir.path().join("agent.sock");
+    let server = ProxyServer::bind(&socket)
+        .await
+        .expect("server should bind");
+    let task = tokio::spawn(server.serve());
+    let client = Client::connect(&socket)
+        .await
+        .expect("client should connect");
+    let request = RunRequest {
+        provider: "claude".into(),
+        model: String::new(),
+        prompt: "test".into(),
+        is_command: false,
+        system: None,
+        permission: "read_only".into(),
+        effort: None,
+        extra_thinking: None,
+        approvals: false,
+        interactive: false,
+        workspace_roots: vec![dir.path().to_string_lossy().into_owned()],
+        resume_session_id: None,
+        binary: Some(binary.to_string_lossy().into_owned()),
+        environment: BTreeMap::new(),
+        unchecked_args: Vec::new(),
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        client
+            .request(ClientMessage::StartRun {
+                run_id: RunId("active".into()),
+                request: Box::new(request.clone()),
+                idempotency_key: "start-active".into(),
+            })
+            .await
+            .expect("start should answer"),
+        ServerResponse::Accepted
+    );
+    assert_eq!(
+        client
+            .request(ClientMessage::Shutdown {
+                mode: ShutdownMode::Drain,
+            })
+            .await
+            .expect("drain should answer"),
+        ServerResponse::Accepted
+    );
+    let late_client = Client::connect(&socket)
+        .await
+        .expect("daemon should keep serving while runs drain");
+    assert!(
+        matches!(
+            late_client
+                .request(ClientMessage::StartRun {
+                    run_id: RunId("too-late".into()),
+                    request: Box::new(request),
+                    idempotency_key: "start-too-late".into(),
+                })
+                .await
+                .expect("rejected start should answer"),
+            ServerResponse::Error {
+                code: ErrorCode::Conflict,
+                message,
+            } if message.contains("stopping")
+        ),
+        "draining closes admission before acknowledging"
+    );
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("server should stop after the run drains")
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test]
+async fn terminating_shutdown_stops_active_runs_before_exit() {
+    let dir = tempdir().expect("temp dir should exist");
+    let binary = dir.path().join("slow-claude");
+    std::fs::write(&binary, "#!/bin/sh\nsleep 30\n").expect("fake provider should write");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        .expect("fake provider should be executable");
+
+    let socket = dir.path().join("agent.sock");
+    let server = ProxyServer::bind(&socket)
+        .await
+        .expect("server should bind");
+    let task = tokio::spawn(server.serve());
+    let client = Client::connect(&socket)
+        .await
+        .expect("client should connect");
+    assert_eq!(
+        client
+            .request(ClientMessage::StartRun {
+                run_id: RunId("active".into()),
+                request: Box::new(RunRequest {
+                    provider: "claude".into(),
+                    model: String::new(),
+                    prompt: "test".into(),
+                    is_command: false,
+                    system: None,
+                    permission: "read_only".into(),
+                    effort: None,
+                    extra_thinking: None,
+                    approvals: false,
+                    interactive: false,
+                    workspace_roots: vec![dir.path().to_string_lossy().into_owned()],
+                    resume_session_id: None,
+                    binary: Some(binary.to_string_lossy().into_owned()),
+                    environment: BTreeMap::new(),
+                    unchecked_args: Vec::new(),
+                    metadata: BTreeMap::new(),
+                }),
+                idempotency_key: "start-active".into(),
+            })
+            .await
+            .expect("start should answer"),
+        ServerResponse::Accepted
+    );
+    assert_eq!(
+        client
+            .request(ClientMessage::Shutdown {
+                mode: ShutdownMode::Terminate,
+            })
+            .await
+            .expect("terminate should answer"),
+        ServerResponse::Accepted
+    );
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("termination should not wait for natural completion")
+        .expect("server task should join")
+        .expect("server should stop cleanly");
 }
 
 #[tokio::test]

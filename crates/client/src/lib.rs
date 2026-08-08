@@ -1,5 +1,6 @@
 use agency_proxy_protocol::{
-    ClientFrame, ClientMessage, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame, ServerResponse,
+    ClientFrame, ClientMessage, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolVersion, ServerFrame,
+    ServerResponse,
 };
 use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_with_max_frame};
 use futures::{SinkExt, StreamExt};
@@ -31,6 +32,7 @@ struct PendingRequest {
 pub struct Client {
     requests: mpsc::Sender<PendingRequest>,
     events: broadcast::Sender<ServerFrame>,
+    version: ProtocolVersion,
 }
 
 impl Client {
@@ -40,7 +42,11 @@ impl Client {
         let (requests, request_rx) = mpsc::channel(64);
         let (events, _) = broadcast::channel(512);
         tokio::spawn(drive(transport, request_rx, events.clone()));
-        let client = Self { requests, events };
+        let mut client = Self {
+            requests,
+            events,
+            version: PROTOCOL_VERSION,
+        };
         match client
             .request(ClientMessage::Hello {
                 client_name: "agency-proxy-client".into(),
@@ -49,6 +55,7 @@ impl Client {
             .await?
         {
             ServerResponse::Hello { version, .. } if version.major == PROTOCOL_VERSION.major => {
+                client.version = version;
                 Ok(client)
             }
             ServerResponse::Error { message, .. } => Err(ClientError::Protocol(message)),
@@ -60,6 +67,11 @@ impl Client {
 
     pub fn subscribe(&self) -> broadcast::Receiver<ServerFrame> {
         self.events.subscribe()
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> ProtocolVersion {
+        self.version
     }
 
     pub async fn request(&self, message: ClientMessage) -> Result<ServerResponse, ClientError> {
