@@ -1,10 +1,14 @@
-use agency_proxy::{ProxyServer, read_frame, write_frame};
+use agency_proxy::ProxyServer;
+use agency_proxy_client::Client;
 use agency_proxy_protocol::{
-    ClientFrame, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerFrame, ServerResponse,
+    ClientFrame, ClientMessage, ErrorCode, MAX_FRAME_BYTES, RunEvent, RunId, RunRequest,
+    ServerFrame, ServerResponse,
 };
-use std::os::unix::fs::PermissionsExt;
+use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_with_max_frame};
+use futures::{SinkExt, StreamExt};
+use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
 use tempfile::tempdir;
-use tokio::{io::BufReader, net::UnixStream};
+use tokio::net::UnixStream;
 
 #[tokio::test]
 async fn hello_then_list_runs_uses_the_versioned_local_protocol() {
@@ -30,58 +34,15 @@ async fn hello_then_list_runs_uses_the_versioned_local_protocol() {
         0o600
     );
     let task = tokio::spawn(server.serve());
-    let stream = UnixStream::connect(&socket)
+    let client = Client::connect(&socket)
         .await
-        .expect("client should connect");
-    let (read, mut write) = stream.into_split();
-    let mut read = BufReader::new(read);
-
-    write_frame(
-        &mut write,
-        &ClientFrame {
-            request_id: 1,
-            message: ClientMessage::Hello {
-                client_name: "test-client".into(),
-                version: PROTOCOL_VERSION,
-            },
-        },
-    )
-    .await
-    .expect("hello should write");
-    let hello: ServerFrame = read_frame(&mut read)
-        .await
-        .expect("hello should read")
-        .expect("hello response should exist");
-    assert!(matches!(
-        hello,
-        ServerFrame::Response {
-            request_id: 1,
-            response: ServerResponse::Hello {
-                version: PROTOCOL_VERSION,
-                ..
-            }
-        }
-    ));
-
-    write_frame(
-        &mut write,
-        &ClientFrame {
-            request_id: 2,
-            message: ClientMessage::ListRuns,
-        },
-    )
-    .await
-    .expect("list should write");
-    let runs: ServerFrame = read_frame(&mut read)
-        .await
-        .expect("runs should read")
-        .expect("runs response should exist");
+        .expect("client should connect and negotiate");
     assert_eq!(
-        runs,
-        ServerFrame::Response {
-            request_id: 2,
-            response: ServerResponse::Runs { runs: Vec::new() },
-        }
+        client
+            .request(ClientMessage::ListRuns)
+            .await
+            .expect("list should succeed"),
+        ServerResponse::Runs { runs: Vec::new() }
     );
     task.abort();
 }
@@ -97,21 +58,28 @@ async fn commands_before_hello_are_rejected() {
     let stream = UnixStream::connect(&socket)
         .await
         .expect("client should connect");
-    let (read, mut write) = stream.into_split();
-    let mut read = BufReader::new(read);
-    write_frame(
-        &mut write,
-        &ClientFrame {
-            request_id: 9,
-            message: ClientMessage::ListRuns,
-        },
-    )
-    .await
-    .expect("frame should write");
-    let response: ServerFrame = read_frame(&mut read)
+    let mut transport = framed_json_with_max_frame(stream, MAX_FRAME_BYTES + 1);
+    let frame = ClientFrame {
+        request_id: 9,
+        message: ClientMessage::ListRuns,
+    };
+    transport
+        .send(WireMessage::Text(
+            serde_json::to_string(&frame).expect("frame should encode"),
+        ))
         .await
-        .expect("response should read")
-        .expect("response should exist");
+        .expect("frame should write");
+    let response = transport
+        .next()
+        .await
+        .expect("response should exist")
+        .expect("response should read");
+    let response: ServerFrame = serde_json::from_str(
+        response
+            .as_text()
+            .expect("response should be a JSON text frame"),
+    )
+    .expect("response should decode");
     assert!(matches!(
         response,
         ServerFrame::Response {
@@ -138,4 +106,107 @@ async fn refuses_to_replace_a_regular_file_at_the_socket_path() {
         std::fs::read(&socket).expect("fixture should remain"),
         b"owner data"
     );
+}
+
+#[tokio::test]
+async fn provider_run_survives_a_client_disconnect_and_replays_on_attach() {
+    let dir = tempdir().expect("temp dir should exist");
+    let binary = dir.path().join("fake-claude");
+    std::fs::write(
+        &binary,
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"proxy-session","model":"fake-model"}'
+printf '%s\n' '{"type":"assistant","session_id":"proxy-session","message":{"content":[{"type":"text","text":"survived restart"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"survived restart","session_id":"proxy-session","usage":{"input_tokens":1,"output_tokens":2}}'
+"#,
+    )
+    .expect("fake provider should write");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        .expect("fake provider should be executable");
+
+    let socket = dir.path().join("agent.sock");
+    let server = ProxyServer::bind(&socket)
+        .await
+        .expect("server should bind");
+    let task = tokio::spawn(server.serve());
+
+    let first = Client::connect(&socket)
+        .await
+        .expect("first client should connect");
+    let run_id = RunId("survivor".into());
+    assert!(matches!(
+        first
+            .request(ClientMessage::StartRun {
+                run_id: run_id.clone(),
+                request: Box::new(RunRequest {
+                    provider: "claude".into(),
+                    model: String::new(),
+                    prompt: "test".into(),
+                    system: None,
+                    permission: "read_only".into(),
+                    effort: None,
+                    extra_thinking: None,
+                    approvals: false,
+                    interactive: false,
+                    workspace_roots: vec![dir.path().to_string_lossy().into_owned()],
+                    resume_session_id: None,
+                    binary: Some(binary.to_string_lossy().into_owned()),
+                    environment: BTreeMap::new(),
+                    unchecked_args: Vec::new(),
+                    metadata: BTreeMap::new(),
+                }),
+                idempotency_key: "start-once".into(),
+            })
+            .await
+            .expect("start should succeed"),
+        ServerResponse::Accepted
+    ));
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let second = Client::connect(&socket)
+        .await
+        .expect("replacement client should connect");
+    let mut events = second.subscribe();
+    assert!(matches!(
+        second
+            .request(ClientMessage::AttachRun {
+                run_id: run_id.clone(),
+                after_sequence: 0,
+            })
+            .await
+            .expect("attach should succeed"),
+        ServerResponse::Run { .. }
+    ));
+
+    let mut saw_text = false;
+    let mut saw_finished = false;
+    let mut latest = 0;
+    for _ in 0..8 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("proxy should replay promptly")
+            .expect("replay frame should exist");
+        if let ServerFrame::Event {
+            sequence, event, ..
+        } = frame
+        {
+            latest = sequence;
+            match event {
+                RunEvent::Text(text) if text == "survived restart" => saw_text = true,
+                RunEvent::Finished(_) => {
+                    saw_finished = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_text, "replacement client receives the missed text");
+    assert!(
+        saw_finished,
+        "replacement client receives the terminal outcome"
+    );
+    assert!(latest > 0);
+    task.abort();
 }

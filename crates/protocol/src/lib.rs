@@ -57,7 +57,7 @@ pub enum ClientMessage {
     ListRuns,
     StartRun {
         run_id: RunId,
-        request: RunRequest,
+        request: Box<RunRequest>,
         idempotency_key: String,
     },
     AttachRun {
@@ -94,9 +94,20 @@ pub struct RunRequest {
     pub provider: String,
     pub model: String,
     pub prompt: String,
+    pub system: Option<String>,
     pub permission: String,
+    pub effort: Option<String>,
+    pub extra_thinking: Option<bool>,
+    pub approvals: bool,
+    pub interactive: bool,
     pub workspace_roots: Vec<String>,
     pub resume_session_id: Option<String>,
+    /// Test/development override; production clients normally leave this unset.
+    pub binary: Option<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub unchecked_args: Vec<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
 }
@@ -194,19 +205,35 @@ pub struct RunSnapshot {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RunEvent {
+    /// The exact terminal outcome after the provider process has been reaped.
+    Finished(Value),
     StateChanged(RunState),
     SessionOpened {
         provider_session_id: String,
+        model: Option<String>,
     },
     Reasoning(String),
     Text(String),
-    Tool(Value),
+    MessageBoundary,
+    ToolCall {
+        id: Option<String>,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        id: Option<String>,
+        ok: Option<bool>,
+        output: String,
+    },
     ApprovalRequested {
         approval_id: String,
         title: String,
         detail: Value,
     },
     Usage(Value),
+    RateLimit(Value),
+    Compaction(Value),
+    Commands(Value),
     Error(String),
 }
 

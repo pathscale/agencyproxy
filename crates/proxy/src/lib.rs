@@ -1,24 +1,21 @@
-//! Local AgencyProxy server foundation.
+//! Local AgencyProxy server and provider-runtime boundary.
 
-mod framing;
+mod runtime;
 
 use agency_proxy_protocol::{
-    Capability, ClientFrame, ClientMessage, ErrorCode, PROTOCOL_VERSION, RunId, RunSnapshot,
+    Capability, ClientFrame, ClientMessage, ErrorCode, MAX_FRAME_BYTES, PROTOCOL_VERSION, RunId,
     ServerFrame, ServerResponse,
 };
+use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_with_max_frame};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 use thiserror::Error;
-use tokio::{
-    io::BufReader,
-    net::{UnixListener, UnixStream},
-    sync::RwLock,
-};
+use tokio::net::{UnixListener, UnixStream};
 
-pub use framing::{read_frame, write_frame};
+pub use runtime::{Attachment, RuntimeError, RuntimeRegistry, SequencedEvent};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -26,23 +23,18 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("invalid JSON frame: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("frame exceeds the protocol size limit")]
-    FrameTooLarge,
-    #[error("connection ended in the middle of a frame")]
-    TruncatedFrame,
+    #[error("transport error: {0}")]
+    Transport(String),
     #[error("another AgencyProxy is already listening at {0}")]
     AlreadyRunning(PathBuf),
     #[error("refusing to replace a non-socket path at {0}")]
     UnsafeSocketPath(PathBuf),
 }
 
-#[derive(Clone, Debug, Default)]
-struct Registry(Arc<RwLock<BTreeMap<RunId, RunSnapshot>>>);
-
 #[derive(Debug)]
 pub struct ProxyServer {
     listener: UnixListener,
-    registry: Registry,
+    registry: RuntimeRegistry,
     socket_path: PathBuf,
 }
 
@@ -54,7 +46,7 @@ impl ProxyServer {
         set_permissions(&socket_path, 0o600)?;
         Ok(Self {
             listener,
-            registry: Registry::default(),
+            registry: RuntimeRegistry::default(),
             socket_path,
         })
     }
@@ -89,7 +81,6 @@ async fn prepare_socket_path(socket_path: &Path) -> Result<(), Error> {
         .ok_or_else(|| Error::UnsafeSocketPath(socket_path.to_path_buf()))?;
     tokio::fs::create_dir_all(parent).await?;
     set_permissions(parent, 0o700)?;
-
     let metadata = match tokio::fs::symlink_metadata(socket_path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -111,36 +102,33 @@ fn set_permissions(path: &Path, mode: u32) -> Result<(), Error> {
     Ok(())
 }
 
-async fn handle_connection(stream: UnixStream, registry: Registry) -> Result<(), Error> {
-    let (read, mut write) = stream.into_split();
-    let mut read = BufReader::new(read);
-    let Some(first) = read_frame::<ClientFrame>(&mut read).await? else {
+async fn handle_connection(stream: UnixStream, registry: RuntimeRegistry) -> Result<(), Error> {
+    let mut transport = framed_json_with_max_frame(stream, MAX_FRAME_BYTES + 1);
+    let Some(first) = receive_client(&mut transport).await? else {
         return Ok(());
     };
-    let ClientMessage::Hello {
-        client_name: _,
-        version,
-    } = first.message
-    else {
-        return send_error(
-            &mut write,
+    let ClientMessage::Hello { version, .. } = first.message else {
+        send_error(
+            &mut transport,
             first.request_id,
             ErrorCode::ProtocolViolation,
             "the first frame must be hello",
         )
-        .await;
+        .await?;
+        return Ok(());
     };
     let Some(version) = PROTOCOL_VERSION.negotiate(version) else {
-        return send_error(
-            &mut write,
+        send_error(
+            &mut transport,
             first.request_id,
             ErrorCode::IncompatibleVersion,
             "the protocol major version is incompatible",
         )
-        .await;
+        .await?;
+        return Ok(());
     };
     send_response(
-        &mut write,
+        &mut transport,
         first.request_id,
         ServerResponse::Hello {
             server_name: "agency-proxy".into(),
@@ -155,60 +143,152 @@ async fn handle_connection(stream: UnixStream, registry: Registry) -> Result<(),
     )
     .await?;
 
-    while let Some(frame) = read_frame::<ClientFrame>(&mut read).await? {
-        match frame.message {
-            ClientMessage::ListRuns => {
-                let runs = registry.0.read().await.values().cloned().collect();
-                send_response(&mut write, frame.request_id, ServerResponse::Runs { runs }).await?;
-            }
-            ClientMessage::AttachRun { run_id, .. } => {
-                let run = registry.0.read().await.get(&run_id).cloned();
-                match run {
-                    Some(run) => {
-                        send_response(&mut write, frame.request_id, ServerResponse::Run { run })
-                            .await?;
+    let (outbound, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<ServerFrame>();
+    let mut attachments = BTreeMap::<RunId, tokio::task::JoinHandle<()>>::new();
+    loop {
+        tokio::select! {
+            Some(frame) = outgoing.recv() => send_server(&mut transport, &frame).await?,
+            incoming = receive_client(&mut transport) => {
+                let Some(frame) = incoming? else { break };
+                match frame.message {
+                    ClientMessage::ListRuns => {
+                        send_response(&mut transport, frame.request_id, ServerResponse::Runs {
+                            runs: registry.list().await,
+                        }).await?;
                     }
-                    None => {
-                        send_error(
-                            &mut write,
-                            frame.request_id,
-                            ErrorCode::NotFound,
-                            "run does not exist",
-                        )
-                        .await?;
+                    ClientMessage::StartRun { run_id, request, .. } => {
+                        match registry.start(run_id, *request).await {
+                            Ok(()) => send_response(&mut transport, frame.request_id, ServerResponse::Accepted).await?,
+                            Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,
+                        }
+                    }
+                    ClientMessage::AttachRun { run_id, after_sequence } => {
+                        match registry.attach(&run_id, after_sequence).await {
+                            Ok(attachment) => {
+                                send_response(&mut transport, frame.request_id, ServerResponse::Run {
+                                    run: attachment.snapshot,
+                                }).await?;
+                                for event in &attachment.replay {
+                                    send_server(&mut transport, &event_frame(event)).await?;
+                                }
+                                if let Some(previous) = attachments.remove(&run_id) { previous.abort(); }
+                                let event_sender = outbound.clone();
+                                let attached_registry = registry.clone();
+                                let attached_run = run_id.clone();
+                                let mut events = attachment.events;
+                                let mut last_sequence = attachment.replay.last()
+                                    .map_or(after_sequence, |event| event.sequence);
+                                attachments.insert(run_id, tokio::spawn(async move {
+                                    loop {
+                                        match events.recv().await {
+                                            Ok(event) => {
+                                                if event.sequence <= last_sequence { continue; }
+                                                last_sequence = event.sequence;
+                                                if event_sender.send(event_frame(&event)).is_err() { return; }
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                                let Ok(replay) = attached_registry.attach(&attached_run, last_sequence).await else { return; };
+                                                for event in &replay.replay {
+                                                    last_sequence = event.sequence;
+                                                    if event_sender.send(event_frame(event)).is_err() { return; }
+                                                }
+                                                events = replay.events;
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                                        }
+                                    }
+                                }));
+                            }
+                            Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,
+                        }
+                    }
+                    ClientMessage::DetachRun { run_id } => {
+                        if let Some(task) = attachments.remove(&run_id) { task.abort(); }
+                        send_response(&mut transport, frame.request_id, ServerResponse::Accepted).await?;
+                    }
+                    ClientMessage::InjectMessage { run_id, body, .. } => {
+                        match registry.inject(&run_id, &body).await {
+                            Ok(()) => send_response(&mut transport, frame.request_id, ServerResponse::Accepted).await?,
+                            Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,
+                        }
+                    }
+                    ClientMessage::CancelRun { run_id, .. } => {
+                        match registry.cancel(&run_id).await {
+                            Ok(()) => send_response(&mut transport, frame.request_id, ServerResponse::Accepted).await?,
+                            Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,
+                        }
+                    }
+                    ClientMessage::DecideApproval { run_id, approval_id, decision, .. } => {
+                        match registry.decide(&run_id, &approval_id, decision).await {
+                            Ok(()) => send_response(&mut transport, frame.request_id, ServerResponse::Accepted).await?,
+                            Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,
+                        }
+                    }
+                    ClientMessage::AckEvents { run_id, through_sequence } => {
+                        match registry.acknowledge(&run_id, through_sequence).await {
+                            Ok(()) => send_response(&mut transport, frame.request_id, ServerResponse::Accepted).await?,
+                            Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,
+                        }
+                    }
+                    ClientMessage::Hello { .. } => {
+                        send_error(&mut transport, frame.request_id, ErrorCode::ProtocolViolation, "hello may only be sent once").await?;
                     }
                 }
             }
-            ClientMessage::Hello { .. } => {
-                send_error(
-                    &mut write,
-                    frame.request_id,
-                    ErrorCode::ProtocolViolation,
-                    "hello may only be sent once",
-                )
-                .await?;
-            }
-            _ => {
-                send_error(
-                    &mut write,
-                    frame.request_id,
-                    ErrorCode::NotImplemented,
-                    "command is part of the protocol but not implemented in this foundation",
-                )
-                .await?;
-            }
         }
+    }
+    for (_, task) in attachments {
+        task.abort();
     }
     Ok(())
 }
 
-async fn send_response(
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+fn event_frame(event: &SequencedEvent) -> ServerFrame {
+    ServerFrame::Event {
+        run_id: event.run_id.clone(),
+        sequence: event.sequence,
+        event: event.event.clone(),
+    }
+}
+
+async fn receive_client<T, E>(transport: &mut T) -> Result<Option<ClientFrame>, Error>
+where
+    T: Stream<Item = Result<WireMessage, E>> + Unpin,
+    E: std::error::Error,
+{
+    match transport.next().await {
+        None | Some(Ok(WireMessage::Close(_))) => Ok(None),
+        Some(Ok(message)) => message
+            .as_text()
+            .ok_or_else(|| Error::Transport("expected a JSON text frame".into()))
+            .and_then(|text| serde_json::from_str(text).map_err(Error::from))
+            .map(Some),
+        Some(Err(error)) => Err(Error::Transport(error.to_string())),
+    }
+}
+
+async fn send_server<T, E>(transport: &mut T, frame: &ServerFrame) -> Result<(), Error>
+where
+    T: Sink<WireMessage, Error = E> + Unpin,
+    E: std::error::Error,
+{
+    transport
+        .send(WireMessage::Text(serde_json::to_string(frame)?))
+        .await
+        .map_err(|error| Error::Transport(error.to_string()))
+}
+
+async fn send_response<T, E>(
+    transport: &mut T,
     request_id: u64,
     response: ServerResponse,
-) -> Result<(), Error> {
-    write_frame(
-        writer,
+) -> Result<(), Error>
+where
+    T: Sink<WireMessage, Error = E> + Unpin,
+    E: std::error::Error,
+{
+    send_server(
+        transport,
         &ServerFrame::Response {
             request_id,
             response,
@@ -217,14 +297,18 @@ async fn send_response(
     .await
 }
 
-async fn send_error(
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+async fn send_error<T, E>(
+    transport: &mut T,
     request_id: u64,
     code: ErrorCode,
     message: &str,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    T: Sink<WireMessage, Error = E> + Unpin,
+    E: std::error::Error,
+{
     send_response(
-        writer,
+        transport,
         request_id,
         ServerResponse::Error {
             code,
@@ -232,4 +316,22 @@ async fn send_error(
         },
     )
     .await
+}
+
+async fn send_runtime_error<T, E>(
+    transport: &mut T,
+    request_id: u64,
+    error: RuntimeError,
+) -> Result<(), Error>
+where
+    T: Sink<WireMessage, Error = E> + Unpin,
+    E: std::error::Error,
+{
+    let code = match &error {
+        RuntimeError::NotFound => ErrorCode::NotFound,
+        RuntimeError::Conflict => ErrorCode::Conflict,
+        RuntimeError::Provider(_) | RuntimeError::Permission(_) => ErrorCode::ProtocolViolation,
+        RuntimeError::Start(_) | RuntimeError::Control(_) => ErrorCode::Internal,
+    };
+    send_error(transport, request_id, code, &error.to_string()).await
 }
