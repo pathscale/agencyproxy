@@ -235,6 +235,8 @@ pub struct RunSnapshot {
     pub latest_sequence: u64,
     pub acknowledged_sequence: u64,
     pub workspace_roots: Vec<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

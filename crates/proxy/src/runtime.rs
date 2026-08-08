@@ -156,6 +156,7 @@ impl RuntimeRegistry {
             latest_sequence: 0,
             acknowledged_sequence: 0,
             workspace_roots: spec.workspace_roots,
+            metadata: spec.metadata,
         };
         {
             let mut runs = self.0.write().await;
