@@ -9,8 +9,10 @@ publish.workspace = true
 [dependencies]
 agent-abstraction = "0.4.15"
 agency-proxy-protocol.workspace = true
+async-trait.workspace = true
 clap.workspace = true
-endpoint-libs.workspace = true
+endpoint-libs = { workspace = true, features = ["ws-http1"] }
+eyre.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,7 +21,9 @@ tokio.workspace = true
 
 [dev-dependencies]
 agency-proxy-client.workspace = true
+libc = "0.2"
 tempfile = "3"
+tokio-tungstenite = "0.29"
 
 [[bin]]
 name = "agency-proxy"

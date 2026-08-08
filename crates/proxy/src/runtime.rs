@@ -25,8 +25,23 @@ struct LiveRun {
     cancel: Option<oneshot::Sender<()>>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct RuntimeRegistry(Arc<RwLock<BTreeMap<RunId, LiveRun>>>);
+#[derive(Clone, Debug)]
+pub struct RuntimeRegistry {
+    runs: Arc<RwLock<BTreeMap<RunId, LiveRun>>>,
+    executor: tokio::runtime::Handle,
+}
+
+impl Default for RuntimeRegistry {
+    fn default() -> Self {
+        Self {
+            runs: Arc::default(),
+            // The registry owns provider tasks across connection transports.
+            // Capturing the daemon runtime here prevents a WebSocket shard or
+            // disconnected client runtime from becoming their accidental owner.
+            executor: tokio::runtime::Handle::current(),
+        }
+    }
+}
 
 pub struct Attachment {
     pub snapshot: RunSnapshot,
@@ -138,7 +153,15 @@ impl RuntimeRegistry {
     }
 
     pub async fn start(&self, run_id: RunId, spec: RunRequest) -> Result<(), RuntimeError> {
-        if self.0.read().await.contains_key(&run_id) {
+        let registry = self.clone();
+        self.executor
+            .spawn(async move { registry.start_owned(run_id, spec).await })
+            .await
+            .map_err(|error| RuntimeError::Start(format!("proxy runtime stopped: {error}")))?
+    }
+
+    async fn start_owned(&self, run_id: RunId, spec: RunRequest) -> Result<(), RuntimeError> {
+        if self.runs.read().await.contains_key(&run_id) {
             return Err(RuntimeError::Conflict);
         }
         let request = build_request(spec.clone())?;
@@ -159,7 +182,7 @@ impl RuntimeRegistry {
             metadata: spec.metadata,
         };
         {
-            let mut runs = self.0.write().await;
+            let mut runs = self.runs.write().await;
             if runs.contains_key(&run_id) {
                 return Err(RuntimeError::Conflict);
             }
@@ -176,7 +199,7 @@ impl RuntimeRegistry {
         }
 
         let registry = self.clone();
-        tokio::spawn(async move {
+        self.executor.spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -217,7 +240,7 @@ impl RuntimeRegistry {
     }
 
     pub async fn list(&self) -> Vec<RunSnapshot> {
-        self.0
+        self.runs
             .read()
             .await
             .values()
@@ -226,7 +249,7 @@ impl RuntimeRegistry {
     }
 
     pub async fn active_count(&self) -> usize {
-        self.0
+        self.runs
             .read()
             .await
             .values()
@@ -243,7 +266,7 @@ impl RuntimeRegistry {
     }
 
     pub async fn attach(&self, run_id: &RunId, after: u64) -> Result<Attachment, RuntimeError> {
-        let runs = self.0.read().await;
+        let runs = self.runs.read().await;
         let run = runs.get(run_id).ok_or(RuntimeError::NotFound)?;
         Ok(Attachment {
             snapshot: run.snapshot.clone(),
@@ -258,7 +281,7 @@ impl RuntimeRegistry {
     }
 
     pub async fn acknowledge(&self, run_id: &RunId, through: u64) -> Result<(), RuntimeError> {
-        let mut runs = self.0.write().await;
+        let mut runs = self.runs.write().await;
         let run = runs.get_mut(run_id).ok_or(RuntimeError::NotFound)?;
         let through = through.min(run.snapshot.latest_sequence);
         run.snapshot.acknowledged_sequence = run.snapshot.acknowledged_sequence.max(through);
@@ -298,7 +321,7 @@ impl RuntimeRegistry {
     }
 
     pub async fn cancel(&self, run_id: &RunId) -> Result<(), RuntimeError> {
-        let mut runs = self.0.write().await;
+        let mut runs = self.runs.write().await;
         let run = runs.get_mut(run_id).ok_or(RuntimeError::NotFound)?;
         let cancel = run.cancel.take().ok_or(RuntimeError::Conflict)?;
         let _ = cancel.send(());
@@ -308,7 +331,7 @@ impl RuntimeRegistry {
     /// Cooperatively stop every provider run that has not reached a terminal
     /// state. Returns the number of runs signalled.
     pub async fn cancel_all(&self) -> usize {
-        let mut runs = self.0.write().await;
+        let mut runs = self.runs.write().await;
         runs.values_mut()
             .filter(|run| {
                 matches!(
@@ -327,7 +350,7 @@ impl RuntimeRegistry {
     }
 
     async fn control(&self, run_id: &RunId) -> Result<agent_abstraction::RunControl, RuntimeError> {
-        self.0
+        self.runs
             .read()
             .await
             .get(run_id)
@@ -434,7 +457,7 @@ impl RuntimeRegistry {
         state: Option<RunState>,
         session: Option<String>,
     ) {
-        let mut runs = self.0.write().await;
+        let mut runs = self.runs.write().await;
         let Some(run) = runs.get_mut(run_id) else {
             return;
         };

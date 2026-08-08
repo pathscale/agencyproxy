@@ -1,6 +1,8 @@
 //! Local AgencyProxy server and provider-runtime boundary.
 
+mod config;
 mod runtime;
+mod web;
 
 use agency_proxy_protocol::{
     Capability, ClientFrame, ClientMessage, ErrorCode, MAX_FRAME_BYTES, PROTOCOL_VERSION, RunId,
@@ -16,7 +18,9 @@ use std::{
 use thiserror::Error;
 use tokio::net::{UnixListener, UnixStream};
 
+pub use config::{ConfigError, ConnectionConfig, ProxyConfig, TlsConfig};
 pub use runtime::{Attachment, RuntimeError, RuntimeRegistry, SequencedEvent};
+pub use web::{WebSocketConfig, WebSocketTlsConfig, serve_websocket};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -48,6 +52,13 @@ struct Lifecycle {
 
 impl ProxyServer {
     pub async fn bind(socket_path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::bind_with_registry(socket_path, RuntimeRegistry::default()).await
+    }
+
+    pub async fn bind_with_registry(
+        socket_path: impl AsRef<Path>,
+        registry: RuntimeRegistry,
+    ) -> Result<Self, Error> {
         let socket_path = socket_path.as_ref().to_path_buf();
         prepare_socket_path(&socket_path).await?;
         let listener = UnixListener::bind(&socket_path)?;
@@ -55,7 +66,7 @@ impl ProxyServer {
         let (shutdown, _) = tokio::sync::watch::channel(false);
         Ok(Self {
             listener,
-            registry: RuntimeRegistry::default(),
+            registry,
             socket_path,
             shutdown,
             lifecycle: Arc::default(),
