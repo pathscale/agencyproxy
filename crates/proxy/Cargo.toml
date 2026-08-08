@@ -1,0 +1,22 @@
+[package]
+name = "agency-proxy"
+description = "Small headless runtime that owns coding-agent processes and sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+agency-proxy-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "agency-proxy"
+path = "src/main.rs"
+
