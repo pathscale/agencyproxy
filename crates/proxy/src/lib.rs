@@ -11,6 +11,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use thiserror::Error;
 use tokio::net::{UnixListener, UnixStream};
@@ -36,6 +37,13 @@ pub struct ProxyServer {
     listener: UnixListener,
     registry: RuntimeRegistry,
     socket_path: PathBuf,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    lifecycle: Arc<tokio::sync::Mutex<Lifecycle>>,
+}
+
+#[derive(Debug, Default)]
+struct Lifecycle {
+    stopping: bool,
 }
 
 impl ProxyServer {
@@ -44,10 +52,13 @@ impl ProxyServer {
         prepare_socket_path(&socket_path).await?;
         let listener = UnixListener::bind(&socket_path)?;
         set_permissions(&socket_path, 0o600)?;
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         Ok(Self {
             listener,
             registry: RuntimeRegistry::default(),
             socket_path,
+            shutdown,
+            lifecycle: Arc::default(),
         })
     }
 
@@ -57,11 +68,25 @@ impl ProxyServer {
     }
 
     pub async fn serve(self) -> Result<(), Error> {
+        let mut shutdown = self.shutdown.subscribe();
         loop {
-            let (stream, _) = self.listener.accept().await?;
+            let accepted = tokio::select! {
+                accepted = self.listener.accept() => accepted,
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            let (stream, _) = accepted?;
             let registry = self.registry.clone();
+            let request_shutdown = self.shutdown.clone();
+            let lifecycle = self.lifecycle.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle_connection(stream, registry).await {
+                if let Err(error) =
+                    handle_connection(stream, registry, request_shutdown, lifecycle).await
+                {
                     eprintln!("AgencyProxy connection failed: {error}");
                 }
             });
@@ -102,7 +127,12 @@ fn set_permissions(path: &Path, mode: u32) -> Result<(), Error> {
     Ok(())
 }
 
-async fn handle_connection(stream: UnixStream, registry: RuntimeRegistry) -> Result<(), Error> {
+async fn handle_connection(
+    stream: UnixStream,
+    registry: RuntimeRegistry,
+    request_shutdown: tokio::sync::watch::Sender<bool>,
+    lifecycle: Arc<tokio::sync::Mutex<Lifecycle>>,
+) -> Result<(), Error> {
     let mut transport = framed_json_with_max_frame(stream, MAX_FRAME_BYTES + 1);
     let Some(first) = receive_client(&mut transport).await? else {
         return Ok(());
@@ -139,6 +169,7 @@ async fn handle_connection(stream: UnixStream, registry: RuntimeRegistry) -> Res
                 Capability::Approvals,
                 Capability::Cancellation,
                 Capability::ProviderDetection,
+                Capability::LifecycleControl,
             ],
         },
     )
@@ -167,7 +198,38 @@ async fn handle_connection(stream: UnixStream, registry: RuntimeRegistry) -> Res
                             providers: registry.account_usage().await,
                         }).await?;
                     }
+                    ClientMessage::ShutdownIfIdle => {
+                        let mut lifecycle = lifecycle.lock().await;
+                        let active = registry.active_count().await;
+                        if active > 0 {
+                            send_error(
+                                &mut transport,
+                                frame.request_id,
+                                ErrorCode::Conflict,
+                                &format!("AgencyProxy has {active} active run(s)"),
+                            ).await?;
+                            continue;
+                        }
+                        lifecycle.stopping = true;
+                        send_response(
+                            &mut transport,
+                            frame.request_id,
+                            ServerResponse::Accepted,
+                        ).await?;
+                        let _ = request_shutdown.send(true);
+                        return Ok(());
+                    }
                     ClientMessage::StartRun { run_id, request, .. } => {
+                        let lifecycle = lifecycle.lock().await;
+                        if lifecycle.stopping {
+                            send_error(
+                                &mut transport,
+                                frame.request_id,
+                                ErrorCode::Conflict,
+                                "AgencyProxy is stopping",
+                            ).await?;
+                            continue;
+                        }
                         match registry.start(run_id, *request).await {
                             Ok(()) => send_response(&mut transport, frame.request_id, ServerResponse::Accepted).await?,
                             Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,

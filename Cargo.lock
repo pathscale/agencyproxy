@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agency-proxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agency-proxy-client",
  "agency-proxy-protocol",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agency-proxy-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agency-proxy-protocol",
  "endpoint-libs",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "agency-proxy-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

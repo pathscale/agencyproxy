@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 0, minor: 1 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 0, minor: 2 };
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -57,6 +57,8 @@ pub enum ClientMessage {
     ListRuns,
     ProbeProviders,
     ReadAccountUsage,
+    /// Stop the daemon only when no provider run is still live.
+    ShutdownIfIdle,
     StartRun {
         run_id: RunId,
         request: Box<RunRequest>,
@@ -174,6 +176,7 @@ pub enum Capability {
     Approvals,
     Cancellation,
     ProviderDetection,
+    LifecycleControl,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

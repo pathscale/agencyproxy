@@ -225,6 +225,23 @@ impl RuntimeRegistry {
             .collect()
     }
 
+    pub async fn active_count(&self) -> usize {
+        self.0
+            .read()
+            .await
+            .values()
+            .filter(|run| {
+                matches!(
+                    run.snapshot.state,
+                    RunState::Starting
+                        | RunState::Running
+                        | RunState::WaitingApproval
+                        | RunState::Finishing
+                )
+            })
+            .count()
+    }
+
     pub async fn attach(&self, run_id: &RunId, after: u64) -> Result<Attachment, RuntimeError> {
         let runs = self.0.read().await;
         let run = runs.get(run_id).ok_or(RuntimeError::NotFound)?;

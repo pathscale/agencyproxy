@@ -48,6 +48,101 @@ async fn hello_then_list_runs_uses_the_versioned_local_protocol() {
 }
 
 #[tokio::test]
+async fn idle_daemon_accepts_a_graceful_shutdown() {
+    let dir = tempdir().expect("temp dir should exist");
+    let socket = dir.path().join("agent.sock");
+    let server = ProxyServer::bind(&socket)
+        .await
+        .expect("server should bind");
+    let task = tokio::spawn(server.serve());
+    let client = Client::connect(&socket)
+        .await
+        .expect("client should connect");
+
+    assert_eq!(
+        client
+            .request(ClientMessage::ShutdownIfIdle)
+            .await
+            .expect("shutdown should answer"),
+        ServerResponse::Accepted
+    );
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("server should stop promptly")
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+    assert!(!socket.exists(), "graceful shutdown removes its socket");
+}
+
+#[tokio::test]
+async fn shutdown_refuses_to_interrupt_an_active_run() {
+    let dir = tempdir().expect("temp dir should exist");
+    let binary = dir.path().join("slow-claude");
+    std::fs::write(
+        &binary,
+        r#"#!/bin/sh
+sleep 2
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"proxy-session","usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+    )
+    .expect("fake provider should write");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        .expect("fake provider should be executable");
+
+    let socket = dir.path().join("agent.sock");
+    let server = ProxyServer::bind(&socket)
+        .await
+        .expect("server should bind");
+    let task = tokio::spawn(server.serve());
+    let client = Client::connect(&socket)
+        .await
+        .expect("client should connect");
+    let run_id = RunId("active".into());
+    assert_eq!(
+        client
+            .request(ClientMessage::StartRun {
+                run_id: run_id.clone(),
+                request: Box::new(RunRequest {
+                    provider: "claude".into(),
+                    model: String::new(),
+                    prompt: "test".into(),
+                    is_command: false,
+                    system: None,
+                    permission: "read_only".into(),
+                    effort: None,
+                    extra_thinking: None,
+                    approvals: false,
+                    interactive: false,
+                    workspace_roots: vec![dir.path().to_string_lossy().into_owned()],
+                    resume_session_id: None,
+                    binary: Some(binary.to_string_lossy().into_owned()),
+                    environment: BTreeMap::new(),
+                    unchecked_args: Vec::new(),
+                    metadata: BTreeMap::new(),
+                }),
+                idempotency_key: "start-active".into(),
+            })
+            .await
+            .expect("start should answer"),
+        ServerResponse::Accepted
+    );
+
+    assert!(matches!(
+        client
+            .request(ClientMessage::ShutdownIfIdle)
+            .await
+            .expect("shutdown refusal should answer"),
+        ServerResponse::Error {
+            code: ErrorCode::Conflict,
+            message,
+        } if message.contains("1 active run")
+    ));
+    assert!(socket.exists(), "refused shutdown keeps serving");
+
+    task.abort();
+}
+
+#[tokio::test]
 async fn commands_before_hello_are_rejected() {
     let dir = tempdir().expect("temp dir should exist");
     let socket = dir.path().join("agent.sock");
@@ -116,6 +211,7 @@ async fn provider_run_survives_a_client_disconnect_and_replays_on_attach() {
         &binary,
         r#"#!/bin/sh
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"proxy-session","model":"fake-model"}'
+sleep 1
 printf '%s\n' '{"type":"assistant","session_id":"proxy-session","message":{"content":[{"type":"text","text":"survived restart"}]}}'
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"survived restart","session_id":"proxy-session","usage":{"input_tokens":1,"output_tokens":2}}'
 "#,
