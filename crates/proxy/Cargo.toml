@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 agent-abstraction = "0.4.15"
 agency-proxy-protocol.workspace = true
+clap.workspace = true
 endpoint-libs.workspace = true
 futures.workspace = true
 serde.workspace = true

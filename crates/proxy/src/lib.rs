@@ -138,6 +138,7 @@ async fn handle_connection(stream: UnixStream, registry: RuntimeRegistry) -> Res
                 Capability::LiveInjection,
                 Capability::Approvals,
                 Capability::Cancellation,
+                Capability::ProviderDetection,
             ],
         },
     )
@@ -154,6 +155,16 @@ async fn handle_connection(stream: UnixStream, registry: RuntimeRegistry) -> Res
                     ClientMessage::ListRuns => {
                         send_response(&mut transport, frame.request_id, ServerResponse::Runs {
                             runs: registry.list().await,
+                        }).await?;
+                    }
+                    ClientMessage::ProbeProviders => {
+                        send_response(&mut transport, frame.request_id, ServerResponse::Providers {
+                            providers: registry.probe_providers().await,
+                        }).await?;
+                    }
+                    ClientMessage::ReadAccountUsage => {
+                        send_response(&mut transport, frame.request_id, ServerResponse::AccountUsage {
+                            providers: registry.account_usage().await,
                         }).await?;
                     }
                     ClientMessage::StartRun { run_id, request, .. } => {

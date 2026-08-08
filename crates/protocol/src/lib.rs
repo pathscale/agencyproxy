@@ -55,6 +55,8 @@ pub enum ClientMessage {
         version: ProtocolVersion,
     },
     ListRuns,
+    ProbeProviders,
+    ReadAccountUsage,
     StartRun {
         run_id: RunId,
         request: Box<RunRequest>,
@@ -94,6 +96,8 @@ pub struct RunRequest {
     pub provider: String,
     pub model: String,
     pub prompt: String,
+    #[serde(default)]
+    pub is_command: bool,
     pub system: Option<String>,
     pub permission: String,
     pub effort: Option<String>,
@@ -146,6 +150,12 @@ pub enum ServerResponse {
     Runs {
         runs: Vec<RunSnapshot>,
     },
+    Providers {
+        providers: Vec<ProviderStatus>,
+    },
+    AccountUsage {
+        providers: Vec<ProviderAccountUsage>,
+    },
     Run {
         run: RunSnapshot,
     },
@@ -163,6 +173,31 @@ pub enum Capability {
     LiveInjection,
     Approvals,
     Cancellation,
+    ProviderDetection,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderStatus {
+    pub provider: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub outdated: bool,
+    pub auth_state: String,
+    pub detail: String,
+    pub auth_method: Option<String>,
+    pub account: Option<String>,
+    pub plan: Option<String>,
+    pub login_hint: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAccountUsage {
+    pub provider: String,
+    pub supported: bool,
+    pub usage: Option<Value>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -207,6 +242,8 @@ pub struct RunSnapshot {
 pub enum RunEvent {
     /// The exact terminal outcome after the provider process has been reaped.
     Finished(Value),
+    /// The provider process could not produce a terminal outcome.
+    Failed(String),
     StateChanged(RunState),
     SessionOpened {
         provider_session_id: String,

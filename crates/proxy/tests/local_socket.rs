@@ -142,6 +142,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"s
                     provider: "claude".into(),
                     model: String::new(),
                     prompt: "test".into(),
+                    is_command: false,
                     system: None,
                     permission: "read_only".into(),
                     effort: None,

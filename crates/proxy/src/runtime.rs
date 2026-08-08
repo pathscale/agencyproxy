@@ -1,5 +1,7 @@
 use agency_proxy_protocol::{ApprovalDecision, RunEvent, RunId, RunRequest, RunSnapshot, RunState};
-use agent_abstraction::{Agent, Decision, Event, Permission, Request};
+use agent_abstraction::{
+    Agent, AuthState, AuthStatus, Decision, Event, Permission, Probe, Request, VersionStatus,
+};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
@@ -49,6 +51,92 @@ pub enum RuntimeError {
 }
 
 impl RuntimeRegistry {
+    pub async fn account_usage(&self) -> Vec<agency_proxy_protocol::ProviderAccountUsage> {
+        futures::future::join_all([Agent::Claude, Agent::Codex, Agent::Copilot].map(
+            |agent| async move {
+                let provider = agent_name(agent).to_string();
+                if !agent.reports_account_usage() {
+                    return agency_proxy_protocol::ProviderAccountUsage {
+                        provider,
+                        supported: false,
+                        usage: None,
+                        error: None,
+                    };
+                }
+                match agent.account_usage().await {
+                    Ok(usage) => agency_proxy_protocol::ProviderAccountUsage {
+                        provider,
+                        supported: true,
+                        usage: serde_json::to_value(usage).ok(),
+                        error: None,
+                    },
+                    Err(error) => agency_proxy_protocol::ProviderAccountUsage {
+                        provider,
+                        supported: true,
+                        usage: None,
+                        error: Some(error.to_string()),
+                    },
+                }
+            },
+        ))
+        .await
+    }
+
+    pub async fn probe_providers(&self) -> Vec<agency_proxy_protocol::ProviderStatus> {
+        futures::future::join_all([Agent::Claude, Agent::Codex, Agent::Copilot].map(
+            |agent| async move {
+                let probe = Probe::run(agent).await;
+                let auth = AuthStatus::check(agent).await;
+                let installed =
+                    !matches!(probe, Err(agent_abstraction::Error::NotInstalled { .. }));
+                let probe = probe.ok();
+                let version = probe
+                    .as_ref()
+                    .and_then(|value| value.version.as_ref().map(ToString::to_string));
+                let outdated = probe
+                    .as_ref()
+                    .is_some_and(|value| matches!(value.status, VersionStatus::Older));
+                let (auth_state, detail, auth_method, account, plan, login_hint) = match auth {
+                    Ok(status) => (
+                        match status.state {
+                            AuthState::LoggedIn => "logged_in",
+                            AuthState::LoggedOut => "logged_out",
+                            AuthState::Unknown => "unknown",
+                            _ => "unknown",
+                        }
+                        .to_string(),
+                        status.detail,
+                        status.method,
+                        status.account,
+                        status.plan,
+                        status.login_hint.to_string(),
+                    ),
+                    Err(error) => (
+                        "unknown".into(),
+                        error.to_string(),
+                        None,
+                        None,
+                        None,
+                        String::new(),
+                    ),
+                };
+                agency_proxy_protocol::ProviderStatus {
+                    provider: agent_name(agent).into(),
+                    installed,
+                    version,
+                    outdated,
+                    auth_state,
+                    detail,
+                    auth_method,
+                    account,
+                    plan,
+                    login_hint,
+                }
+            },
+        ))
+        .await
+    }
+
     pub async fn start(&self, run_id: RunId, spec: RunRequest) -> Result<(), RuntimeError> {
         if self.0.read().await.contains_key(&run_id) {
             return Err(RuntimeError::Conflict);
@@ -296,7 +384,7 @@ impl RuntimeRegistry {
     }
 
     async fn publish_error(&self, run_id: &RunId, error: String, state: RunState) {
-        self.publish(run_id, RunEvent::Error(error), Some(state), None)
+        self.publish(run_id, RunEvent::Failed(error), Some(state), None)
             .await;
     }
 
@@ -328,6 +416,14 @@ impl RuntimeRegistry {
     }
 }
 
+fn agent_name(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Claude => "claude",
+        Agent::Codex => "codex",
+        Agent::Copilot => "copilot",
+    }
+}
+
 fn build_request(spec: RunRequest) -> Result<Request, RuntimeError> {
     let agent = match spec.provider.as_str() {
         "claude" => Agent::Claude,
@@ -343,7 +439,18 @@ fn build_request(spec: RunRequest) -> Result<Request, RuntimeError> {
         "bypass" => Permission::Bypass,
         other => return Err(RuntimeError::Permission(other.into())),
     };
-    let mut request = Request::new(agent, spec.prompt).permission(permission);
+    let mut request = if spec.is_command {
+        match spec.prompt.as_str() {
+            "/compact" => Request::command(
+                agent,
+                &agent_abstraction::Command::Compact { instructions: None },
+            ),
+            other => return Err(RuntimeError::Start(format!("unsupported command: {other}"))),
+        }
+    } else {
+        Request::new(agent, spec.prompt)
+    }
+    .permission(permission);
     if let Some(root) = spec.workspace_roots.first() {
         request = request.cwd(root);
         for extra in spec.workspace_roots.iter().skip(1) {

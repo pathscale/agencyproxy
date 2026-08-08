@@ -1,25 +1,18 @@
 use agency_proxy::ProxyServer;
+use clap::Parser;
 use std::{path::PathBuf, process::ExitCode};
 
-const USAGE: &str = "usage: agency-proxy --socket PATH";
-
-fn socket_arg() -> Result<PathBuf, String> {
-    let mut args = std::env::args_os().skip(1);
-    match (args.next(), args.next(), args.next()) {
-        (Some(flag), Some(path), None) if flag == "--socket" => Ok(path.into()),
-        _ => Err(USAGE.into()),
-    }
+#[derive(Debug, Parser)]
+#[command(name = "agency-proxy", version, about)]
+struct Args {
+    /// Permission-restricted local endpoint used by AgencyZero clients.
+    #[arg(long, value_name = "PATH")]
+    socket: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let socket_path = match socket_arg() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(2);
-        }
-    };
+    let socket_path = Args::parse().socket;
     let server = match ProxyServer::bind(&socket_path).await {
         Ok(server) => server,
         Err(error) => {

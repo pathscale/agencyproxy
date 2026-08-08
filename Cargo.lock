@@ -9,6 +9,7 @@ dependencies = [
  "agency-proxy-client",
  "agency-proxy-protocol",
  "agent-abstraction",
+ "clap",
  "endpoint-libs",
  "futures",
  "serde",
