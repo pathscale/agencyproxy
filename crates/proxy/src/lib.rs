@@ -447,6 +447,7 @@ where
     let code = match &error {
         RuntimeError::NotFound => ErrorCode::NotFound,
         RuntimeError::Conflict => ErrorCode::Conflict,
+        RuntimeError::ReplayExpired { .. } => ErrorCode::Conflict,
         RuntimeError::Provider(_) | RuntimeError::Permission(_) => ErrorCode::ProtocolViolation,
         RuntimeError::Start(_) | RuntimeError::Control(_) => ErrorCode::Internal,
     };
