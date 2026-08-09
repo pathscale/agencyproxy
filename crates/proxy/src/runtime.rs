@@ -204,14 +204,19 @@ impl RuntimeRegistry {
                 tokio::select! {
                     biased;
                     _ = &mut cancelled => {
-                        match run.cancel().await {
-                            Ok(outcome) => {
-                                registry.publish_finished(&run_id, outcome, RunState::Canceled).await;
-                            }
-                            Err(error) => {
-                                registry.publish_error(&run_id, error.to_string(), RunState::Canceled).await;
-                            }
-                        }
+                        // Dropping the abstraction run synchronously terminates its
+                        // provider process group and aborts its driver. Awaiting
+                        // `Run::cancel` can wait forever when a provider ignores
+                        // cancellation, which leaves the proxy run non-terminal and
+                        // makes every later GUI Stop request a no-op.
+                        drop(run);
+                        registry
+                            .publish_error(
+                                &run_id,
+                                "the run was canceled".into(),
+                                RunState::Canceled,
+                            )
+                            .await;
                         return;
                     }
                     event = run.recv() => {
