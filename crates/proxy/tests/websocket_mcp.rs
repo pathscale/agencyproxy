@@ -26,7 +26,10 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        // Full workspace runs can contend with several process-backed transport
+        // tests on CI. Keep the assertion bounded while allowing scheduler
+        // headroom beyond the fake provider's intentional one-second delay.
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
             .await
             .expect("server should answer promptly")
             .expect("server should keep the connection open")
