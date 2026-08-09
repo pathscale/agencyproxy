@@ -78,6 +78,15 @@ async fn authenticated_websocket_serves_the_minimal_mcp_surface() {
     };
     socket
         .send(Message::Text(
+            json!({"method":1,"seq":1,"params":{}}).to_string().into(),
+        ))
+        .await
+        .expect("legacy frame should send");
+    let rejected = receive_json(&mut socket).await;
+    assert_eq!(rejected["error"]["code"], -32600);
+
+    socket
+        .send(Message::Text(
             json!({
                 "jsonrpc":"2.0",
                 "id":1,
@@ -119,9 +128,11 @@ async fn authenticated_websocket_serves_the_minimal_mcp_surface() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool should have a name"))
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 9);
+    assert_eq!(names.len(), 11);
     assert!(names.contains(&"list_runs"));
     assert!(names.contains(&"start_run"));
+    assert!(names.contains(&"subscribe_run"));
+    assert!(names.contains(&"unsubscribe_run"));
     assert!(!names.iter().any(|name| name.contains("shutdown")));
 
     socket
@@ -428,4 +439,142 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn subscribe_replays_then_pushes_sequence_numbered_mcp_notifications() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let address = unused_loopback_address();
+    let dir = tempdir().expect("temporary provider directory should exist");
+    let provider = dir.path().join("eventful-claude");
+    std::fs::write(
+        &provider,
+        r#"#!/bin/sh
+sleep 1
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"proxy-session","usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+    )
+    .expect("fake provider should write");
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700))
+        .expect("fake provider should be executable");
+
+    let task = tokio::spawn(serve_websocket(
+        RuntimeRegistry::default(),
+        WebSocketConfig {
+            address,
+            authentication_key: KEY.into(),
+            allowed_origins: vec!["https://agencyzero.example".into()],
+            tls: None,
+        },
+    ));
+    let mut request = format!("ws://{address}")
+        .into_client_request()
+        .expect("WebSocket request should build");
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_str(&format!("agency-proxy.{KEY}"))
+            .expect("authentication protocol should be valid"),
+    );
+    request.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_static("https://agencyzero.example"),
+    );
+    let (mut socket, _) = loop {
+        match connect_async(request.clone()).await {
+            Ok(connected) => break connected,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{
+                    "protocolVersion":"2025-06-18","capabilities":{},
+                    "clientInfo":{"name":"subscription-test","version":"0"}
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("initialize should send");
+    let _ = receive_json(&mut socket).await;
+    socket
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("initialized notification should send");
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{
+                    "name":"start_run",
+                    "arguments":{
+                        "runId":"subscribed",
+                        "request":{
+                            "provider":"claude","model":"","prompt":"test",
+                            "isCommand":false,"system":null,"permission":"read_only",
+                            "effort":null,"extraThinking":null,"approvals":false,
+                            "interactive":false,
+                            "workspaceRoots":[dir.path().to_string_lossy()],
+                            "resumeSessionId":null,"binary":provider.to_string_lossy(),
+                            "environment":{},"uncheckedArgs":[],"metadata":{}
+                        }
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("start_run should send");
+    let started = receive_json(&mut socket).await;
+    assert_eq!(started["result"]["isError"], false);
+
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc":"2.0","id":3,"method":"tools/call",
+                "params":{
+                    "name":"subscribe_run",
+                    "arguments":{"runId":"subscribed","afterSequence":0}
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("subscribe_run should send");
+    let subscribed = receive_json(&mut socket).await;
+    assert_eq!(subscribed["id"], 3);
+    assert_eq!(subscribed["result"]["isError"], false);
+    let replayed_through = subscribed["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("subscribe result should contain replay")
+        .last()
+        .and_then(|event| event["sequence"].as_u64())
+        .unwrap_or(0);
+
+    let notification = loop {
+        let frame = receive_json(&mut socket).await;
+        if frame["method"] == "notifications/run_event" {
+            break frame;
+        }
+    };
+    assert_eq!(notification["params"]["runId"], "subscribed");
+    assert!(
+        notification["params"]["sequence"]
+            .as_u64()
+            .expect("notification should carry a sequence")
+            > replayed_through
+    );
+
+    task.abort();
 }

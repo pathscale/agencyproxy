@@ -8,17 +8,26 @@ use endpoint_libs::{
     libs::{
         error_code::ErrorCode,
         handler::{HandlerError, RequestHandler, Response},
-        toolbox::{ArcToolbox, RequestContext},
+        peer::PeerIdentity,
+        toolbox::{ArcToolbox, RequestContext, TOOLBOX},
         ws::{
-            AuthController, WebsocketServer, WsConnection, WsRequest, WsResponse, WsServerConfig,
-            mcp::McpServerInfo, toolbox::CustomError,
+            AuthController, ConnectionId, OnDisconnect, WebsocketServer, WsConnection, WsRequest,
+            WsResponse, WsServerConfig, mcp::McpServerInfo, toolbox::CustomError,
         },
     },
     model::TypeRegistry,
 };
 use futures::{FutureExt, future::LocalBoxFuture};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 const AUTHENTICATED_ROLE: u32 = 1;
 
@@ -79,11 +88,14 @@ pub async fn serve_websocket(
         priv_key,
         allow_cors_urls: Arc::new(Some(config.allowed_origins)),
         drop_conn_on_buffer_full: true,
+        mcp_only: true,
         ..Default::default()
     });
     server.set_auth_controller(Authentication {
         protocol: format!("agency-proxy.{}", config.authentication_key),
     });
+    let subscriptions = RunSubscriptions::default();
+    server.add_on_disconnect_hook(subscriptions.clone());
     server.add_handler(MethodListRuns(registry.clone()));
     server.add_handler(MethodReadRun(registry.clone()));
     server.add_handler(MethodStartRun(registry.clone()));
@@ -93,6 +105,11 @@ pub async fn serve_websocket(
     server.add_handler(MethodAcknowledgeRun(registry.clone()));
     server.add_handler(MethodProbeProviders(registry.clone()));
     server.add_handler(MethodReadAccountUsage(registry));
+    server.add_handler(MethodSubscribeRun {
+        registry: drain_registry.clone(),
+        subscriptions: subscriptions.clone(),
+    });
+    server.add_handler(MethodUnsubscribeRun { subscriptions });
     server.enable_mcp(
         &TypeRegistry::new(),
         McpServerInfo {
@@ -115,6 +132,80 @@ pub async fn serve_websocket(
         eprintln!("AgencyProxy WebSocket runs drained");
     }
     result
+}
+
+type SubscriptionKey = (ConnectionId, String);
+
+#[derive(Clone, Default)]
+struct RunSubscriptions {
+    active: Arc<Mutex<HashMap<SubscriptionKey, (u64, tokio::task::AbortHandle)>>>,
+    next_generation: Arc<AtomicU64>,
+}
+
+impl RunSubscriptions {
+    fn next_generation(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn insert(&self, key: SubscriptionKey, generation: u64, handle: tokio::task::AbortHandle) {
+        if let Ok(mut active) = self.active.lock()
+            && let Some((_, previous)) = active.insert(key, (generation, handle))
+        {
+            previous.abort();
+        }
+    }
+
+    fn remove_if_current(&self, key: &SubscriptionKey, generation: u64) {
+        if let Ok(mut active) = self.active.lock()
+            && active
+                .get(key)
+                .is_some_and(|(current, _)| *current == generation)
+        {
+            active.remove(key);
+        }
+    }
+
+    fn unsubscribe(&self, connection_id: ConnectionId, run_id: &str) -> bool {
+        let key = (connection_id, run_id.to_string());
+        let removed = self
+            .active
+            .lock()
+            .ok()
+            .and_then(|mut active| active.remove(&key));
+        if let Some((_, handle)) = removed {
+            handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn disconnect(&self, connection_id: ConnectionId) {
+        let removed = self
+            .active
+            .lock()
+            .map(|mut active| {
+                let keys = active
+                    .keys()
+                    .filter(|(candidate, _)| *candidate == connection_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .filter_map(|key| active.remove(&key))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (_, handle) in removed {
+            handle.abort();
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl OnDisconnect for RunSubscriptions {
+    async fn on_disconnect(&self, connection_id: ConnectionId, _peer: &PeerIdentity) {
+        self.disconnect(connection_id);
+    }
 }
 
 fn runtime_error(error: RuntimeError) -> HandlerError<CustomError> {
@@ -230,6 +321,195 @@ impl RequestHandler for MethodReadRun {
                     event: event.event,
                 })
                 .collect(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeRunRequest {
+    pub run_id: String,
+    #[serde(default)]
+    pub after_sequence: u64,
+}
+
+response!(SubscribeRunResponse, SubscribeRunRequest, {
+    run: RunSnapshot,
+    events: Vec<WebRunEvent>,
+});
+
+impl WsRequest for SubscribeRunRequest {
+    type Response = SubscribeRunResponse;
+    const METHOD_ID: u32 = 10;
+    const ROLES: &'static [u32] = &[AUTHENTICATED_ROLE];
+    const SCHEMA: &'static str = r#"{
+        "name":"SubscribeRun","code":10,
+        "parameters":[{"name":"runId","ty":"String"},{"name":"afterSequence","ty":"Int64"}],
+        "returns":[{"name":"run","ty":"Object"},{"name":"events","ty":{"Vec":"Object"}}],
+        "description":"Returns a run snapshot and ordered replay, then pushes new events as MCP notifications/run_event notifications on this WebSocket.","roles":[]
+    }"#;
+}
+
+struct MethodSubscribeRun {
+    registry: RuntimeRegistry,
+    subscriptions: RunSubscriptions,
+}
+
+#[async_trait(?Send)]
+impl RequestHandler for MethodSubscribeRun {
+    type Request = SubscribeRunRequest;
+    type Error = CustomError;
+
+    async fn handle(
+        &self,
+        ctx: RequestContext,
+        req: SubscribeRunRequest,
+    ) -> Response<SubscribeRunRequest> {
+        let run_id = RunId(req.run_id.clone());
+        let attachment = self
+            .registry
+            .attach(&run_id, req.after_sequence)
+            .await
+            .map_err(runtime_error)?;
+        let replay = attachment
+            .replay
+            .iter()
+            .map(|event| WebRunEvent {
+                sequence: event.sequence,
+                event: event.event.clone(),
+            })
+            .collect::<Vec<_>>();
+        let last_sequence = attachment
+            .replay
+            .last()
+            .map_or(req.after_sequence, |event| event.sequence);
+        let key = (ctx.connection_id, req.run_id);
+        let generation = self.subscriptions.next_generation();
+        let subscriptions = self.subscriptions.clone();
+        let cleanup_key = key.clone();
+        let registry = self.registry.clone();
+        let toolbox = TOOLBOX.with(Arc::clone);
+        let connection_id = ctx.connection_id;
+        let task = tokio::task::spawn_local(async move {
+            forward_run_events(
+                registry,
+                toolbox,
+                connection_id,
+                run_id,
+                last_sequence,
+                attachment.events,
+            )
+            .await;
+            subscriptions.remove_if_current(&cleanup_key, generation);
+        });
+        self.subscriptions
+            .insert(key, generation, task.abort_handle());
+        drop(task);
+
+        Ok(SubscribeRunResponse {
+            run: attachment.snapshot,
+            events: replay,
+        })
+    }
+}
+
+async fn forward_run_events(
+    registry: RuntimeRegistry,
+    toolbox: ArcToolbox,
+    connection_id: ConnectionId,
+    run_id: RunId,
+    mut last_sequence: u64,
+    mut events: tokio::sync::broadcast::Receiver<crate::SequencedEvent>,
+) {
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                if event.sequence <= last_sequence {
+                    continue;
+                }
+                last_sequence = event.sequence;
+                if !send_run_event(&toolbox, connection_id, &event) {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let Ok(attachment) = registry.attach(&run_id, last_sequence).await else {
+                    return;
+                };
+                for event in attachment.replay {
+                    if event.sequence <= last_sequence {
+                        continue;
+                    }
+                    last_sequence = event.sequence;
+                    if !send_run_event(&toolbox, connection_id, &event) {
+                        return;
+                    }
+                }
+                events = attachment.events;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+fn send_run_event(
+    toolbox: &ArcToolbox,
+    connection_id: ConnectionId,
+    event: &crate::SequencedEvent,
+) -> bool {
+    toolbox.send_raw(
+        connection_id,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/run_event",
+            "params": {
+                "runId": event.run_id,
+                "sequence": event.sequence,
+                "event": event.event,
+            }
+        })
+        .to_string(),
+    )
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnsubscribeRunRequest {
+    pub run_id: String,
+}
+
+response!(UnsubscribeRunResponse, UnsubscribeRunRequest, { removed: bool });
+
+impl WsRequest for UnsubscribeRunRequest {
+    type Response = UnsubscribeRunResponse;
+    const METHOD_ID: u32 = 11;
+    const ROLES: &'static [u32] = &[AUTHENTICATED_ROLE];
+    const SCHEMA: &'static str = r#"{
+        "name":"UnsubscribeRun","code":11,
+        "parameters":[{"name":"runId","ty":"String"}],
+        "returns":[{"name":"removed","ty":"Boolean"}],
+        "description":"Stops MCP run-event notifications for one run on this WebSocket.","roles":[]
+    }"#;
+}
+
+struct MethodUnsubscribeRun {
+    subscriptions: RunSubscriptions,
+}
+
+#[async_trait(?Send)]
+impl RequestHandler for MethodUnsubscribeRun {
+    type Request = UnsubscribeRunRequest;
+    type Error = CustomError;
+
+    async fn handle(
+        &self,
+        ctx: RequestContext,
+        req: UnsubscribeRunRequest,
+    ) -> Response<UnsubscribeRunRequest> {
+        Ok(UnsubscribeRunResponse {
+            removed: self
+                .subscriptions
+                .unsubscribe(ctx.connection_id, &req.run_id),
         })
     }
 }
