@@ -15,7 +15,7 @@ agency-proxy-protocol = { version = "=0.1.4", path = "crates/protocol" }
 agency-proxy-client = { version = "=0.1.4", path = "crates/client" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
-endpoint-libs = { git = "https://github.com/pathscale/endpoint-libs", rev = "41fe416", default-features = false, features = ["framed-transport"] }
+endpoint-libs = { version = "=2.1.4", default-features = false, features = ["framed-transport"] }
 eyre = "0.6"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
