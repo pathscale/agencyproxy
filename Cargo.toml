@@ -6,13 +6,13 @@ members = ["crates/client", "crates/protocol", "crates/proxy"]
 version = "0.1.4"
 edition = "2024"
 license = "Apache-2.0"
-publish = false
+publish = true
 homepage = "https://github.com/pathscale/agencyproxy"
 repository = "https://github.com/pathscale/agencyproxy"
 
 [workspace.dependencies]
-agency-proxy-protocol = { path = "crates/protocol" }
-agency-proxy-client = { path = "crates/client" }
+agency-proxy-protocol = { version = "=0.1.4", path = "crates/protocol" }
+agency-proxy-client = { version = "=0.1.4", path = "crates/client" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 endpoint-libs = { git = "https://github.com/pathscale/endpoint-libs", rev = "41fe416", default-features = false, features = ["framed-transport"] }
