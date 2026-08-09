@@ -143,6 +143,103 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
 }
 
 #[tokio::test]
+async fn cancel_stops_an_uncooperative_provider_and_publishes_a_terminal_event() {
+    let dir = tempdir().expect("temp dir should exist");
+    let binary = dir.path().join("stubborn-claude");
+    std::fs::write(&binary, "#!/bin/sh\ntrap '' TERM\nsleep 30\n")
+        .expect("fake provider should write");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        .expect("fake provider should be executable");
+
+    let socket = dir.path().join("agent.sock");
+    let server = ProxyServer::bind(&socket)
+        .await
+        .expect("server should bind");
+    let task = tokio::spawn(server.serve());
+    let client = Client::connect(&socket)
+        .await
+        .expect("client should connect");
+    let mut events = client.subscribe();
+    let run_id = RunId("stubborn".into());
+    assert_eq!(
+        client
+            .request(ClientMessage::StartRun {
+                run_id: run_id.clone(),
+                request: Box::new(RunRequest {
+                    provider: "claude".into(),
+                    model: String::new(),
+                    prompt: "test".into(),
+                    is_command: false,
+                    system: None,
+                    permission: "read_only".into(),
+                    effort: None,
+                    extra_thinking: None,
+                    approvals: false,
+                    interactive: false,
+                    workspace_roots: vec![dir.path().to_string_lossy().into_owned()],
+                    resume_session_id: None,
+                    binary: Some(binary.to_string_lossy().into_owned()),
+                    environment: BTreeMap::new(),
+                    unchecked_args: Vec::new(),
+                    metadata: BTreeMap::new(),
+                }),
+                idempotency_key: "start-stubborn".into(),
+            })
+            .await
+            .expect("start should answer"),
+        ServerResponse::Accepted
+    );
+    assert!(matches!(
+        client
+            .request(ClientMessage::AttachRun {
+                run_id: run_id.clone(),
+                after_sequence: 0,
+            })
+            .await
+            .expect("attach should answer"),
+        ServerResponse::Run { .. }
+    ));
+
+    assert_eq!(
+        client
+            .request(ClientMessage::CancelRun {
+                run_id: run_id.clone(),
+                idempotency_key: "cancel-stubborn".into(),
+            })
+            .await
+            .expect("cancel should answer"),
+        ServerResponse::Accepted
+    );
+
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let ServerFrame::Event {
+                run_id: event_run_id,
+                event: RunEvent::Failed(message),
+                ..
+            } = events.recv().await.expect("event stream should stay open")
+                && event_run_id == run_id
+            {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("cancel should publish a terminal event promptly");
+    assert_eq!(terminal, "the run was canceled");
+
+    assert!(matches!(
+        client
+            .request(ClientMessage::ListRuns)
+            .await
+            .expect("list should answer"),
+        ServerResponse::Runs { runs }
+            if runs.iter().any(|run| run.run_id == run_id && run.state == agency_proxy_protocol::RunState::Canceled)
+    ));
+    task.abort();
+}
+
+#[tokio::test]
 async fn draining_shutdown_rejects_new_runs_and_waits_for_the_active_run() {
     let dir = tempdir().expect("temp dir should exist");
     let binary = dir.path().join("slow-claude");
