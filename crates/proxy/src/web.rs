@@ -212,6 +212,7 @@ fn runtime_error(error: RuntimeError) -> HandlerError<CustomError> {
     let code = match error {
         RuntimeError::Conflict => ErrorCode::CONFLICT,
         RuntimeError::NotFound => ErrorCode::NOT_FOUND,
+        RuntimeError::ReplayExpired { .. } => ErrorCode::CONFLICT,
         RuntimeError::Provider(_) | RuntimeError::Permission(_) => ErrorCode::BAD_REQUEST,
         RuntimeError::Start(_) | RuntimeError::Control(_) => ErrorCode::INTERNAL_ERROR,
     };

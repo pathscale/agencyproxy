@@ -9,6 +9,8 @@ use std::{
 use thiserror::Error;
 use tokio::sync::{RwLock, broadcast, oneshot};
 
+const MAX_REPLAY_EVENTS: usize = 2_048;
+
 #[derive(Clone, Debug)]
 pub struct SequencedEvent {
     pub run_id: RunId,
@@ -20,6 +22,7 @@ pub struct SequencedEvent {
 struct LiveRun {
     snapshot: RunSnapshot,
     journal: VecDeque<SequencedEvent>,
+    replay_floor: u64,
     events: broadcast::Sender<SequencedEvent>,
     control: agent_abstraction::RunControl,
     cancel: Option<oneshot::Sender<()>>,
@@ -55,6 +58,8 @@ pub enum RuntimeError {
     Conflict,
     #[error("run does not exist")]
     NotFound,
+    #[error("requested replay sequence {requested} is older than retained sequence {earliest}")]
+    ReplayExpired { requested: u64, earliest: u64 },
     #[error("unsupported provider: {0}")]
     Provider(String),
     #[error("unsupported permission: {0}")]
@@ -191,6 +196,7 @@ impl RuntimeRegistry {
                 LiveRun {
                     snapshot,
                     journal: VecDeque::new(),
+                    replay_floor: 0,
                     events,
                     control,
                     cancel: Some(cancel),
@@ -273,6 +279,12 @@ impl RuntimeRegistry {
     pub async fn attach(&self, run_id: &RunId, after: u64) -> Result<Attachment, RuntimeError> {
         let runs = self.runs.read().await;
         let run = runs.get(run_id).ok_or(RuntimeError::NotFound)?;
+        if after < run.replay_floor {
+            return Err(RuntimeError::ReplayExpired {
+                requested: after,
+                earliest: run.replay_floor,
+            });
+        }
         Ok(Attachment {
             snapshot: run.snapshot.clone(),
             replay: run
@@ -478,8 +490,21 @@ impl RuntimeRegistry {
             sequence: run.snapshot.latest_sequence,
             event,
         };
-        run.journal.push_back(event.clone());
+        push_journal(&mut run.journal, &mut run.replay_floor, event.clone());
         let _ = run.events.send(event);
+    }
+}
+
+fn push_journal(
+    journal: &mut VecDeque<SequencedEvent>,
+    replay_floor: &mut u64,
+    event: SequencedEvent,
+) {
+    journal.push_back(event);
+    while journal.len() > MAX_REPLAY_EVENTS {
+        if let Some(expired) = journal.pop_front() {
+            *replay_floor = (*replay_floor).max(expired.sequence);
+        }
     }
 }
 
@@ -555,4 +580,32 @@ fn build_request(spec: RunRequest) -> Result<Request, RuntimeError> {
         request = request.unchecked_args(spec.unchecked_args);
     }
     Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_journal_is_bounded_and_tracks_expired_sequence() {
+        let mut journal = VecDeque::new();
+        let mut replay_floor = 0;
+        let run_id = RunId("bounded-run".into());
+
+        for sequence in 1..=(MAX_REPLAY_EVENTS as u64 + 3) {
+            push_journal(
+                &mut journal,
+                &mut replay_floor,
+                SequencedEvent {
+                    run_id: run_id.clone(),
+                    sequence,
+                    event: RunEvent::Text(sequence.to_string()),
+                },
+            );
+        }
+
+        assert_eq!(journal.len(), MAX_REPLAY_EVENTS);
+        assert_eq!(replay_floor, 3);
+        assert_eq!(journal.front().map(|event| event.sequence), Some(4));
+    }
 }
