@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-agent-abstraction = "0.4.15"
+agent-abstraction = "0.4.19"
 agency-proxy-protocol.workspace = true
 async-trait.workspace = true
 clap.workspace = true

@@ -179,6 +179,7 @@ async fn handle_connection(
                 Capability::LiveInjection,
                 Capability::Approvals,
                 Capability::Cancellation,
+                Capability::SessionInterruption,
                 Capability::ProviderDetection,
                 Capability::LifecycleControl,
             ],
@@ -332,6 +333,16 @@ async fn handle_connection(
                     ClientMessage::CancelRun { run_id, .. } => {
                         match registry.cancel(&run_id).await {
                             Ok(()) => send_response(&mut transport, frame.request_id, ServerResponse::Accepted).await?,
+                            Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,
+                        }
+                    }
+                    ClientMessage::InterruptSession { provider, session_id, binary, .. } => {
+                        match registry.interrupt_session(&provider, &session_id, binary).await {
+                            Ok(interrupted) => send_response(
+                                &mut transport,
+                                frame.request_id,
+                                ServerResponse::SessionInterrupted { interrupted },
+                            ).await?,
                             Err(error) => send_runtime_error(&mut transport, frame.request_id, error).await?,
                         }
                     }
