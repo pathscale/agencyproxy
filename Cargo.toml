@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/client", "crates/protocol", "crates/proxy"]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "Apache-2.0"
 publish = true
@@ -11,8 +11,8 @@ homepage = "https://github.com/pathscale/agencyproxy"
 repository = "https://github.com/pathscale/agencyproxy"
 
 [workspace.dependencies]
-agency-proxy-protocol = { version = "=0.1.6", path = "crates/protocol" }
-agency-proxy-client = { version = "=0.1.6", path = "crates/client" }
+agency-proxy-protocol = { version = "0.1.7", path = "crates/protocol" }
+agency-proxy-client = { version = "0.1.7", path = "crates/client" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 endpoint-libs = { version = "=2.1.5", default-features = false, features = ["framed-transport"] }

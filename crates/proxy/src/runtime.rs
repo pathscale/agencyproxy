@@ -1,6 +1,7 @@
 use agency_proxy_protocol::{ApprovalDecision, RunEvent, RunId, RunRequest, RunSnapshot, RunState};
 use agent_abstraction::{
     Agent, AuthState, AuthStatus, Decision, Event, Permission, Probe, Request, VersionStatus,
+    interrupt,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -210,12 +211,12 @@ impl RuntimeRegistry {
                 tokio::select! {
                     biased;
                     _ = &mut cancelled => {
-                        // Dropping the abstraction run synchronously terminates its
-                        // provider process group and aborts its driver. Awaiting
-                        // `Run::cancel` can wait forever when a provider ignores
-                        // cancellation, which leaves the proxy run non-terminal and
-                        // makes every later GUI Stop request a no-op.
-                        drop(run);
+                        // Cooperative cancellation gives interactive providers
+                        // their protocol-level interrupt before the abstraction's
+                        // bounded process-group fallback. Dropping this handle
+                        // skipped Codex `turn/interrupt`, leaving the server-owned
+                        // turn alive after AgencyProxy reported it canceled.
+                        let _ = run.cancel().await;
                         registry
                             .publish_error(
                                 &run_id,
@@ -343,6 +344,29 @@ impl RuntimeRegistry {
         let cancel = run.cancel.take().ok_or(RuntimeError::Conflict)?;
         let _ = cancel.send(());
         Ok(())
+    }
+
+    /// Interrupt an orphaned provider turn without submitting a new prompt.
+    pub async fn interrupt_session(
+        &self,
+        provider: &str,
+        session_id: &str,
+        binary: Option<String>,
+    ) -> Result<bool, RuntimeError> {
+        let agent = agent_for_provider(provider)?;
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err(RuntimeError::Provider("the session id is empty".into()));
+        }
+        let mut request = Request::new(agent, "")
+            .resume(session_id)
+            .permission(Permission::ReadOnly);
+        if let Some(binary) = binary.filter(|value| !value.is_empty()) {
+            request = request.bin(binary);
+        }
+        interrupt(&request)
+            .await
+            .map_err(|error| RuntimeError::Control(error.to_string()))
     }
 
     /// Cooperatively stop every provider run that has not reached a terminal
@@ -516,13 +540,17 @@ fn agent_name(agent: Agent) -> &'static str {
     }
 }
 
+fn agent_for_provider(provider: &str) -> Result<Agent, RuntimeError> {
+    match provider {
+        "claude" => Ok(Agent::Claude),
+        "codex" => Ok(Agent::Codex),
+        "copilot" => Ok(Agent::Copilot),
+        other => Err(RuntimeError::Provider(other.into())),
+    }
+}
+
 fn build_request(spec: RunRequest) -> Result<Request, RuntimeError> {
-    let agent = match spec.provider.as_str() {
-        "claude" => Agent::Claude,
-        "codex" => Agent::Codex,
-        "copilot" => Agent::Copilot,
-        other => return Err(RuntimeError::Provider(other.into())),
-    };
+    let agent = agent_for_provider(&spec.provider)?;
     let permission = match spec.permission.as_str() {
         "read_only" | "read-only" => Permission::ReadOnly,
         "plan" => Permission::Plan,

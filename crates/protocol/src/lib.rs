@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 0, minor: 3 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 0, minor: 4 };
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,6 +83,15 @@ pub enum ClientMessage {
     },
     CancelRun {
         run_id: RunId,
+        idempotency_key: String,
+    },
+    /// Interrupt an orphaned provider turn by its native session id without
+    /// starting a replacement prompt.
+    InterruptSession {
+        provider: String,
+        session_id: String,
+        /// Test/development override; production clients normally leave this unset.
+        binary: Option<String>,
         idempotency_key: String,
     },
     DecideApproval {
@@ -176,6 +185,9 @@ pub enum ServerResponse {
         run: RunSnapshot,
     },
     Accepted,
+    SessionInterrupted {
+        interrupted: bool,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -189,6 +201,7 @@ pub enum Capability {
     LiveInjection,
     Approvals,
     Cancellation,
+    SessionInterruption,
     ProviderDetection,
     LifecycleControl,
 }
@@ -316,6 +329,22 @@ mod tests {
             message: ClientMessage::AttachRun {
                 run_id: RunId("run-7".into()),
                 after_sequence: 41,
+            },
+        };
+        let encoded = serde_json::to_vec(&frame).expect("frame should encode");
+        let decoded: ClientFrame = serde_json::from_slice(&encoded).expect("frame should decode");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn session_interrupts_round_trip_with_the_native_session_id() {
+        let frame = ClientFrame {
+            request_id: 8,
+            message: ClientMessage::InterruptSession {
+                provider: "codex".into(),
+                session_id: "thread-8".into(),
+                binary: None,
+                idempotency_key: "interrupt-thread-8".into(),
             },
         };
         let encoded = serde_json::to_vec(&frame).expect("frame should encode");
