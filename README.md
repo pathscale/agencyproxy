@@ -49,3 +49,11 @@ Run it with `agency-proxy --config /path/to/agency-proxy.json`. TLS is optional
 for local development, but an HTTPS-hosted frontend should use the configured
 certificate and connect with `wss://`. Browser clients authenticate with the
 WebSocket subprotocol `agency-proxy.<authenticationKey>`.
+
+## Publishing
+
+The three crates share the workspace version. A merge to `master` that changes
+the root `Cargo.toml` runs the full CI checks, then publishes any missing crates
+in dependency order: protocol, client, and daemon. The repository must provide
+an Actions secret named `CARGO_REGISTRY_TOKEN` with permission to publish all
+three crates.
