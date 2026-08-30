@@ -243,10 +243,11 @@ async fn cancel_stops_an_uncooperative_provider_and_publishes_a_terminal_event()
 async fn draining_shutdown_rejects_new_runs_and_waits_for_the_active_run() {
     let dir = tempdir().expect("temp dir should exist");
     let binary = dir.path().join("slow-claude");
+    let release = dir.path().join("release-provider");
     std::fs::write(
         &binary,
         r#"#!/bin/sh
-sleep 1
+while [ ! -f "$AGENCY_PROXY_TEST_RELEASE" ]; do sleep 0.01; done
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"proxy-session","usage":{"input_tokens":1,"output_tokens":1}}'
 "#,
     )
@@ -276,7 +277,10 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         workspace_roots: vec![dir.path().to_string_lossy().into_owned()],
         resume_session_id: None,
         binary: Some(binary.to_string_lossy().into_owned()),
-        environment: BTreeMap::new(),
+        environment: BTreeMap::from([(
+            "AGENCY_PROXY_TEST_RELEASE".into(),
+            release.to_string_lossy().into_owned(),
+        )]),
         unchecked_args: Vec::new(),
         metadata: BTreeMap::new(),
     };
@@ -320,6 +324,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         ),
         "draining closes admission before acknowledging"
     );
+    std::fs::write(&release, "release").expect("provider release should write");
     tokio::time::timeout(Duration::from_secs(2), task)
         .await
         .expect("server should stop after the run drains")
@@ -405,7 +410,9 @@ async fn commands_before_hello_are_rejected() {
     };
     transport
         .send(WireMessage::Text(
-            serde_json::to_string(&frame).expect("frame should encode"),
+            serde_json::to_string(&frame)
+                .expect("frame should encode")
+                .into(),
         ))
         .await
         .expect("frame should write");
