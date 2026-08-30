@@ -110,7 +110,7 @@ async fn drive<T, E>(
                         continue;
                     }
                 };
-                if let Err(error) = transport.send(WireMessage::Text(encoded)).await {
+                if let Err(error) = transport.send(WireMessage::Text(encoded.into())).await {
                     let detail = error.to_string();
                     let _ = request.response.send(Err(ClientError::Transport(detail.clone())));
                     break detail;

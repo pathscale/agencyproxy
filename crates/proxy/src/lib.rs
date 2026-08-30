@@ -401,7 +401,7 @@ where
     E: std::error::Error,
 {
     transport
-        .send(WireMessage::Text(serde_json::to_string(frame)?))
+        .send(WireMessage::Text(serde_json::to_string(frame)?.into()))
         .await
         .map_err(|error| Error::Transport(error.to_string()))
 }
