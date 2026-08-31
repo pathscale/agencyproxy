@@ -257,9 +257,7 @@ async fn handle_connection(
                             if mode == ShutdownMode::Terminate {
                                 registry.cancel_all().await;
                             }
-                            while registry.active_count().await > 0 {
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                            }
+                            registry.wait_until_idle().await;
                             let _ = request_shutdown.send(true);
                         });
                         return Ok(());

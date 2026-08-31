@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error;
-use tokio::sync::{RwLock, broadcast, oneshot};
+use tokio::sync::{RwLock, broadcast, oneshot, watch};
 
 const MAX_REPLAY_EVENTS: usize = 2_048;
 
@@ -27,18 +27,59 @@ struct LiveRun {
     events: broadcast::Sender<SequencedEvent>,
     control: agent_abstraction::RunControl,
     cancel: Option<oneshot::Sender<()>>,
+    completed: watch::Sender<bool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RuntimeRegistry {
     runs: Arc<RwLock<BTreeMap<RunId, LiveRun>>>,
+    activity: RunActivity,
     executor: tokio::runtime::Handle,
+}
+
+#[derive(Clone, Debug)]
+struct RunActivity {
+    active: watch::Sender<usize>,
+}
+
+impl Default for RunActivity {
+    fn default() -> Self {
+        let (active, _) = watch::channel(0);
+        Self { active }
+    }
+}
+
+impl RunActivity {
+    fn started(&self) {
+        self.active.send_modify(|active| *active += 1);
+    }
+
+    fn finished(&self) {
+        self.active.send_modify(|active| {
+            debug_assert!(*active > 0, "a run finished without being active");
+            *active = active.saturating_sub(1);
+        });
+    }
+
+    fn count(&self) -> usize {
+        *self.active.borrow()
+    }
+
+    async fn wait_until_idle(&self) {
+        let mut active = self.active.subscribe();
+        while *active.borrow_and_update() > 0 {
+            if active.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 impl Default for RuntimeRegistry {
     fn default() -> Self {
         Self {
             runs: Arc::default(),
+            activity: RunActivity::default(),
             // The registry owns provider tasks across connection transports.
             // Capturing the daemon runtime here prevents a WebSocket shard or
             // disconnected client runtime from becoming their accidental owner.
@@ -176,6 +217,7 @@ impl RuntimeRegistry {
         let control = run.control();
         let (events, _) = broadcast::channel(256);
         let (cancel, mut cancelled) = oneshot::channel();
+        let (completed, _) = watch::channel(false);
         let snapshot = RunSnapshot {
             run_id: run_id.clone(),
             state: RunState::Starting,
@@ -201,8 +243,10 @@ impl RuntimeRegistry {
                     events,
                     control,
                     cancel: Some(cancel),
+                    completed,
                 },
             );
+            self.activity.started();
         }
 
         let registry = self.clone();
@@ -261,20 +305,12 @@ impl RuntimeRegistry {
     }
 
     pub async fn active_count(&self) -> usize {
-        self.runs
-            .read()
-            .await
-            .values()
-            .filter(|run| {
-                matches!(
-                    run.snapshot.state,
-                    RunState::Starting
-                        | RunState::Running
-                        | RunState::WaitingApproval
-                        | RunState::Finishing
-                )
-            })
-            .count()
+        self.activity.count()
+    }
+
+    /// Wait until every run accepted by this registry reaches a terminal state.
+    pub async fn wait_until_idle(&self) {
+        self.activity.wait_until_idle().await;
     }
 
     pub async fn attach(&self, run_id: &RunId, after: u64) -> Result<Attachment, RuntimeError> {
@@ -339,10 +375,17 @@ impl RuntimeRegistry {
     }
 
     pub async fn cancel(&self, run_id: &RunId) -> Result<(), RuntimeError> {
-        let mut runs = self.runs.write().await;
-        let run = runs.get_mut(run_id).ok_or(RuntimeError::NotFound)?;
-        let cancel = run.cancel.take().ok_or(RuntimeError::Conflict)?;
+        // Subscribe before delivering cancellation. A fast provider can emit
+        // its terminal event in the same scheduling turn; installing the
+        // receiver first makes the acknowledgement race-free.
+        let (cancel, completed) = {
+            let mut runs = self.runs.write().await;
+            let run = runs.get_mut(run_id).ok_or(RuntimeError::NotFound)?;
+            let cancel = run.cancel.take().ok_or(RuntimeError::Conflict)?;
+            (cancel, run.completed.subscribe())
+        };
         let _ = cancel.send(());
+        wait_until_completed(completed).await;
         Ok(())
     }
 
@@ -503,9 +546,11 @@ impl RuntimeRegistry {
             return;
         };
         run.snapshot.latest_sequence += 1;
+        let was_active = is_active_state(&run.snapshot.state);
         if let Some(state) = state {
             run.snapshot.state = state;
         }
+        let finished = was_active && !is_active_state(&run.snapshot.state);
         if let Some(session) = session {
             run.snapshot.provider_session_id = Some(session);
         }
@@ -516,7 +561,26 @@ impl RuntimeRegistry {
         };
         push_journal(&mut run.journal, &mut run.replay_floor, event.clone());
         let _ = run.events.send(event);
+        if finished {
+            run.completed.send_replace(true);
+            self.activity.finished();
+        }
     }
+}
+
+async fn wait_until_completed(mut completed: watch::Receiver<bool>) {
+    while !*completed.borrow_and_update() {
+        if completed.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+fn is_active_state(state: &RunState) -> bool {
+    matches!(
+        state,
+        RunState::Starting | RunState::Running | RunState::WaitingApproval | RunState::Finishing
+    )
 }
 
 fn push_journal(
@@ -635,5 +699,50 @@ mod tests {
         assert_eq!(journal.len(), MAX_REPLAY_EVENTS);
         assert_eq!(replay_floor, 3);
         assert_eq!(journal.front().map(|event| event.sequence), Some(4));
+    }
+
+    #[tokio::test]
+    async fn activity_waits_for_the_last_run_without_polling() {
+        let activity = RunActivity::default();
+        activity.started();
+        activity.started();
+
+        let waiter = tokio::spawn({
+            let activity = activity.clone();
+            async move { activity.wait_until_idle().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        activity.finished();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        activity.finished();
+        waiter.await.unwrap();
+        assert_eq!(activity.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn activity_wait_returns_immediately_when_idle() {
+        RunActivity::default().wait_until_idle().await;
+    }
+
+    #[tokio::test]
+    async fn completion_wait_observes_a_signal_without_polling() {
+        let (completed, receiver) = watch::channel(false);
+        let waiter = tokio::spawn(wait_until_completed(receiver));
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        completed.send_replace(true);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_wait_returns_immediately_after_the_signal() {
+        let (completed, receiver) = watch::channel(false);
+        completed.send_replace(true);
+        wait_until_completed(receiver).await;
     }
 }

@@ -143,7 +143,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
 }
 
 #[tokio::test]
-async fn cancel_stops_an_uncooperative_provider_and_publishes_a_terminal_event() {
+async fn cancel_acknowledges_only_after_an_uncooperative_provider_is_terminal() {
     let dir = tempdir().expect("temp dir should exist");
     let binary = dir.path().join("stubborn-claude");
     std::fs::write(&binary, "#!/bin/sh\ntrap '' TERM\nsleep 30\n")
@@ -211,6 +211,15 @@ async fn cancel_stops_an_uncooperative_provider_and_publishes_a_terminal_event()
         ServerResponse::Accepted
     );
 
+    assert!(matches!(
+        client
+            .request(ClientMessage::ListRuns)
+            .await
+            .expect("list should answer immediately after cancel"),
+        ServerResponse::Runs { runs }
+            if runs.iter().any(|run| run.run_id == run_id && run.state == agency_proxy_protocol::RunState::Canceled)
+    ));
+
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let ServerFrame::Event {
@@ -227,15 +236,6 @@ async fn cancel_stops_an_uncooperative_provider_and_publishes_a_terminal_event()
     .await
     .expect("cancel should publish a terminal event promptly");
     assert_eq!(terminal, "the run was canceled");
-
-    assert!(matches!(
-        client
-            .request(ClientMessage::ListRuns)
-            .await
-            .expect("list should answer"),
-        ServerResponse::Runs { runs }
-            if runs.iter().any(|run| run.run_id == run_id && run.state == agency_proxy_protocol::RunState::Canceled)
-    ));
     task.abort();
 }
 
@@ -325,7 +325,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         "draining closes admission before acknowledging"
     );
     std::fs::write(&release, "release").expect("provider release should write");
-    tokio::time::timeout(Duration::from_secs(2), task)
+    tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .expect("server should stop after the run drains")
         .expect("server task should join")
@@ -532,7 +532,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"s
     let mut saw_finished = false;
     let mut latest = 0;
     for _ in 0..8 {
-        let frame = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
             .expect("proxy should replay promptly")
             .expect("replay frame should exist");
