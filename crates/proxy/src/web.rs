@@ -125,9 +125,7 @@ pub async fn serve_websocket(
     // endpoint-libs closes admission before returning from `listen` on TERM.
     // Keep the process alive until every provider already accepted by this
     // registry settles, matching the Unix transport's drain restart contract.
-    while drain_registry.active_count().await > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    drain_registry.wait_until_idle().await;
     if active > 0 {
         eprintln!("AgencyProxy WebSocket runs drained");
     }
