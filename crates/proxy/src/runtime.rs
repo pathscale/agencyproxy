@@ -114,8 +114,8 @@ pub enum RuntimeError {
 
 impl RuntimeRegistry {
     pub async fn account_usage(&self) -> Vec<agency_proxy_protocol::ProviderAccountUsage> {
-        futures::future::join_all([Agent::Claude, Agent::Codex, Agent::Copilot].map(
-            |agent| async move {
+        futures::future::join_all(
+            [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Grok].map(|agent| async move {
                 let provider = agent_name(agent).to_string();
                 if !agent.reports_account_usage() {
                     return agency_proxy_protocol::ProviderAccountUsage {
@@ -139,14 +139,14 @@ impl RuntimeRegistry {
                         error: Some(error.to_string()),
                     },
                 }
-            },
-        ))
+            }),
+        )
         .await
     }
 
     pub async fn probe_providers(&self) -> Vec<agency_proxy_protocol::ProviderStatus> {
-        futures::future::join_all([Agent::Claude, Agent::Codex, Agent::Copilot].map(
-            |agent| async move {
+        futures::future::join_all(
+            [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Grok].map(|agent| async move {
                 let probe = Probe::run(agent).await;
                 let auth = AuthStatus::check(agent).await;
                 let installed =
@@ -194,8 +194,8 @@ impl RuntimeRegistry {
                     plan,
                     login_hint,
                 }
-            },
-        ))
+            }),
+        )
         .await
     }
 
@@ -601,6 +601,7 @@ fn agent_name(agent: Agent) -> &'static str {
         Agent::Claude => "claude",
         Agent::Codex => "codex",
         Agent::Copilot => "copilot",
+        Agent::Grok => "grok",
     }
 }
 
@@ -609,6 +610,7 @@ fn agent_for_provider(provider: &str) -> Result<Agent, RuntimeError> {
         "claude" => Ok(Agent::Claude),
         "codex" => Ok(Agent::Codex),
         "copilot" => Ok(Agent::Copilot),
+        "grok" => Ok(Agent::Grok),
         other => Err(RuntimeError::Provider(other.into())),
     }
 }
