@@ -100,7 +100,14 @@ jobs:
             if [ -n "$published" ]; then
               echo "$crate_name $VERSION is already published; skipping"
             else
-              cargo publish -p "$crate_name" --locked --registry crates-io
+              # No `--locked` here, deliberately, though the packaging step
+              # above keeps it. Publishing the first crate makes the second
+              # one's dependency on it resolvable at the new version, which
+              # changes the lockfile; `--locked` then refuses and aborts the
+              # sequence partway. That leaves some crates permanently on
+              # crates.io and the rest not, which is the one failure in this
+              # job that re-running cannot repair.
+              cargo publish -p "$crate_name" --registry crates-io
             fi
           done
 
