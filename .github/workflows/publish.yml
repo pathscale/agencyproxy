@@ -41,14 +41,18 @@ jobs:
         if: inputs.dry_run
         run: cargo package --workspace
 
-      # Cargo knows which crates are publishable, what order they depend on
-      # each other in, and which versions are already on the registry - it
-      # warns and skips those. This used to say all of it again: a hand-kept
-      # list of crate names in dependency order, a `cargo metadata` per crate
-      # to read one field out of the same output, and a jq query against the
-      # crates.io API per crate. Every line was a second copy of something
-      # cargo already knew, and the copy is what goes stale when a crate is
-      # added.
+      # Cargo knows which crates are publishable and what order they depend on
+      # each other in. This used to say both again: a hand-kept list of crate
+      # names in dependency order, a `cargo metadata` per crate to read one
+      # field out of the same output, and a jq query against the crates.io API
+      # per crate. Every line was a second copy of something cargo already
+      # knew, and the copy is what goes stale when a crate is added.
+      #
+      # What cargo does not do is tolerate a version already on the registry:
+      # it fails the whole run with "already exists on crates.io index". A dry
+      # run only warns about that, so it is easy to ship this broken - it
+      # happened in ps-vello. The re-run of a partial release is exactly the
+      # case worth surviving, so that one error passes and nothing else does.
       #
       # No `--locked`: publishing one crate makes the next one's dependency on
       # it resolvable at the new version, which changes the lockfile, and
@@ -56,6 +60,16 @@ jobs:
       # permanently live.
       - name: Publish
         if: '!inputs.dry_run'
+        shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --workspace
+        run: |
+          set -o pipefail
+          if cargo publish --workspace 2>&1 | tee /tmp/publish.log; then
+            exit 0
+          fi
+          if grep -q "already exists on crates.io index" /tmp/publish.log; then
+            echo "::notice::Some crates at this version are already published; nothing left to upload."
+            exit 0
+          fi
+          exit 1
