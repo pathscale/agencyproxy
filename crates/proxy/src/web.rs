@@ -117,7 +117,10 @@ pub async fn serve_websocket(
             version: env!("CARGO_PKG_VERSION").into(),
         },
     )?;
-    let result = server.listen().await;
+    // `listen` blocks until a signal arrives in endpoint-libs 3: it builds its
+    // own reactor, registers SIGTERM and SIGINT on it, and returns when either
+    // fires.
+    let result = server.listen();
     let active = drain_registry.active_count().await;
     if active > 0 {
         eprintln!("AgencyProxy WebSocket admission closed; draining {active} active run(s)");

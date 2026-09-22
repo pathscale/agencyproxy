@@ -4,11 +4,15 @@ use agency_proxy_protocol::{
     ClientFrame, ClientMessage, ErrorCode, MAX_FRAME_BYTES, RunEvent, RunId, RunRequest,
     ServerFrame, ServerResponse, ShutdownMode,
 };
-use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_with_max_frame};
+// endpoint-libs 3.2 removed the tokio flavour of the transport; the neutral
+// framing takes a `futures_io` stream, so a tokio `UnixStream` bridges through
+// tokio-util's `compat`.
+use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_neutral_with_max_frame};
 use futures::{SinkExt, StreamExt};
 use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
 use tempfile::tempdir;
 use tokio::net::UnixStream;
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 #[tokio::test]
 async fn hello_then_list_runs_uses_the_versioned_local_protocol() {
@@ -403,7 +407,7 @@ async fn commands_before_hello_are_rejected() {
     let stream = UnixStream::connect(&socket)
         .await
         .expect("client should connect");
-    let mut transport = framed_json_with_max_frame(stream, MAX_FRAME_BYTES + 1);
+    let mut transport = framed_json_neutral_with_max_frame(stream.compat(), MAX_FRAME_BYTES + 1);
     let frame = ClientFrame {
         request_id: 9,
         message: ClientMessage::ListRuns,
