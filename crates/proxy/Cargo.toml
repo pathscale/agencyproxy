@@ -9,6 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
+tokio-util = { version = "^0.7", features = ["compat"] }
 agent-abstraction = "0.4.21"
 agency-proxy-protocol.workspace = true
 async-trait.workspace = true

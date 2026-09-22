@@ -2,7 +2,10 @@ use agency_proxy_protocol::{
     ClientFrame, ClientMessage, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolVersion, ServerFrame,
     ServerResponse,
 };
-use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_with_max_frame};
+// endpoint-libs 3.2 removed the tokio flavour of the transport; the neutral
+// framing takes a `futures_io` stream, so a tokio `UnixStream` bridges through
+// tokio-util's `compat`.
+use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_neutral_with_max_frame};
 use futures::{SinkExt, StreamExt};
 use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
@@ -10,6 +13,7 @@ use tokio::{
     net::UnixStream,
     sync::{broadcast, mpsc, oneshot},
 };
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -38,7 +42,7 @@ pub struct Client {
 impl Client {
     pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(socket_path).await?;
-        let transport = framed_json_with_max_frame(stream, MAX_FRAME_BYTES + 1);
+        let transport = framed_json_neutral_with_max_frame(stream.compat(), MAX_FRAME_BYTES + 1);
         let (requests, request_rx) = mpsc::channel(64);
         let (events, _) = broadcast::channel(512);
         tokio::spawn(drive(transport, request_rx, events.clone()));

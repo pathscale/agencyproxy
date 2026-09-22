@@ -8,7 +8,10 @@ use agency_proxy_protocol::{
     Capability, ClientFrame, ClientMessage, ErrorCode, MAX_FRAME_BYTES, PROTOCOL_VERSION, RunId,
     ServerFrame, ServerResponse, ShutdownMode,
 };
-use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_with_max_frame};
+// endpoint-libs 3.2 removed the tokio flavour of the transport; the neutral
+// framing takes a `futures_io` stream, so a tokio `UnixStream` bridges through
+// tokio-util's `compat`.
+use endpoint_libs::libs::ws::{WireMessage, transport::framed::framed_json_neutral_with_max_frame};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use std::{
     collections::BTreeMap,
@@ -17,6 +20,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::net::{UnixListener, UnixStream};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 pub use config::{ConfigError, ConnectionConfig, ProxyConfig, TlsConfig};
 pub use runtime::{Attachment, RuntimeError, RuntimeRegistry, SequencedEvent};
@@ -144,7 +148,7 @@ async fn handle_connection(
     request_shutdown: tokio::sync::watch::Sender<bool>,
     lifecycle: Arc<tokio::sync::Mutex<Lifecycle>>,
 ) -> Result<(), Error> {
-    let mut transport = framed_json_with_max_frame(stream, MAX_FRAME_BYTES + 1);
+    let mut transport = framed_json_neutral_with_max_frame(stream.compat(), MAX_FRAME_BYTES + 1);
     let Some(first) = receive_client(&mut transport).await? else {
         return Ok(());
     };
