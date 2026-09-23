@@ -1,14 +1,24 @@
+use crate::{broadcast, flag::Flag};
 use agency_proxy_protocol::{ApprovalDecision, RunEvent, RunId, RunRequest, RunSnapshot, RunState};
 use agent_abstraction::{
     Agent, AuthState, AuthStatus, Decision, Event, Permission, Probe, Request, VersionStatus,
     interrupt,
 };
+use futures::{
+    channel::oneshot,
+    future::{Either, select},
+};
+use nagoya::reactor::Handle;
+use nagoya::sync::{Notify, RwLock};
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    pin::pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use thiserror::Error;
-use tokio::sync::{RwLock, broadcast, oneshot, watch};
 
 const MAX_REPLAY_EVENTS: usize = 2_048;
 
@@ -27,63 +37,71 @@ struct LiveRun {
     events: broadcast::Sender<SequencedEvent>,
     control: agent_abstraction::RunControl,
     cancel: Option<oneshot::Sender<()>>,
-    completed: watch::Sender<bool>,
+    completed: Arc<Flag>,
 }
 
+/// Owns provider runs across connection transports.
+///
+/// Under tokio the registry captured the daemon runtime's handle so that a
+/// WebSocket shard or a disconnected client's runtime could not become the
+/// accidental owner of provider tasks. Tasks now go to nagoya's shared pool,
+/// which belongs to no connection. What the registry holds instead is the
+/// reactor its provider processes are registered on, given to it by whoever
+/// owns that reactor. There is no `Default`: a registry cannot conjure a
+/// reactor without owning one.
 #[derive(Clone, Debug)]
 pub struct RuntimeRegistry {
     runs: Arc<RwLock<BTreeMap<RunId, LiveRun>>>,
     activity: RunActivity,
-    executor: tokio::runtime::Handle,
+    reactor: Handle,
 }
 
-#[derive(Clone, Debug)]
+/// How many accepted runs have not reached a terminal state.
+///
+/// This was a `tokio::sync::watch::Sender<usize>`. Only the count and a wake
+/// on change were used, so it is an atomic and a `Notify`.
+#[derive(Clone, Debug, Default)]
 struct RunActivity {
-    active: watch::Sender<usize>,
+    inner: Arc<ActivityState>,
 }
 
-impl Default for RunActivity {
-    fn default() -> Self {
-        let (active, _) = watch::channel(0);
-        Self { active }
-    }
+#[derive(Debug, Default)]
+struct ActivityState {
+    active: AtomicUsize,
+    changed: Notify,
 }
 
 impl RunActivity {
     fn started(&self) {
-        self.active.send_modify(|active| *active += 1);
+        self.inner.active.fetch_add(1, Ordering::SeqCst);
+        self.inner.changed.notify_waiters();
     }
 
     fn finished(&self) {
-        self.active.send_modify(|active| {
-            debug_assert!(*active > 0, "a run finished without being active");
-            *active = active.saturating_sub(1);
-        });
+        let (Ok(previous) | Err(previous)) =
+            self.inner
+                .active
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                    Some(active.saturating_sub(1))
+                });
+        debug_assert!(previous > 0, "a run finished without being active");
+        self.inner.changed.notify_waiters();
     }
 
     fn count(&self) -> usize {
-        *self.active.borrow()
+        self.inner.active.load(Ordering::SeqCst)
     }
 
     async fn wait_until_idle(&self) {
-        let mut active = self.active.subscribe();
-        while *active.borrow_and_update() > 0 {
-            if active.changed().await.is_err() {
-                break;
+        loop {
+            // Created before the count is read: `Notify` snapshots its
+            // broadcast generation here, so a run finishing between the read
+            // and the await still wakes this waiter.
+            let changed = self.inner.changed.notified();
+            if self.count() == 0 {
+                return;
             }
-        }
-    }
-}
-
-impl Default for RuntimeRegistry {
-    fn default() -> Self {
-        Self {
-            runs: Arc::default(),
-            activity: RunActivity::default(),
-            // The registry owns provider tasks across connection transports.
-            // Capturing the daemon runtime here prevents a WebSocket shard or
-            // disconnected client runtime from becoming their accidental owner.
-            executor: tokio::runtime::Handle::current(),
+            changed.await;
         }
     }
 }
@@ -113,20 +131,33 @@ pub enum RuntimeError {
 }
 
 impl RuntimeRegistry {
-    /// Run `future` on the runtime that owns this registry's provider tasks.
+    /// An empty registry whose provider processes are registered on
+    /// `reactor`. The caller owns the reactor and must keep it running for as
+    /// long as any run it started may still be live.
+    #[must_use]
+    pub fn new(reactor: Handle) -> Self {
+        Self {
+            runs: Arc::default(),
+            activity: RunActivity::default(),
+            reactor,
+        }
+    }
+
+    /// Run `future` on the pool that owns this registry's provider tasks.
     ///
-    /// For work started from a transport whose own executor is not tokio's,
-    /// such as an endpoint-libs WebSocket handler, which is polled on that
-    /// server's reactor and can neither `spawn_local` nor reach tokio's timers.
-    pub(crate) fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    /// For work started from a transport whose own executor is not the pool,
+    /// such as an endpoint-libs WebSocket handler, which is polled in place on
+    /// that server's reactor thread and has no spawner of its own.
+    pub(crate) fn spawn<F>(&self, future: F) -> nagoya::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.executor.spawn(future)
+        nagoya::spawn(future)
     }
 
     pub async fn account_usage(&self) -> Vec<agency_proxy_protocol::ProviderAccountUsage> {
+        let reactor = &self.reactor;
         futures::future::join_all(
             [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Grok].map(|agent| async move {
                 let provider = agent_name(agent).to_string();
@@ -138,7 +169,7 @@ impl RuntimeRegistry {
                         error: None,
                     };
                 }
-                match agent.account_usage().await {
+                match agent.account_usage(reactor).await {
                     Ok(usage) => agency_proxy_protocol::ProviderAccountUsage {
                         provider,
                         supported: true,
@@ -158,10 +189,11 @@ impl RuntimeRegistry {
     }
 
     pub async fn probe_providers(&self) -> Vec<agency_proxy_protocol::ProviderStatus> {
+        let reactor = &self.reactor;
         futures::future::join_all(
             [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Grok].map(|agent| async move {
-                let probe = Probe::run(agent).await;
-                let auth = AuthStatus::check(agent).await;
+                let probe = Probe::run(agent, reactor).await;
+                let auth = AuthStatus::check(agent, reactor).await;
                 let installed =
                     !matches!(probe, Err(agent_abstraction::Error::NotInstalled { .. }));
                 let probe = probe.ok();
@@ -214,10 +246,13 @@ impl RuntimeRegistry {
 
     pub async fn start(&self, run_id: RunId, spec: RunRequest) -> Result<(), RuntimeError> {
         let registry = self.clone();
-        self.executor
-            .spawn(async move { registry.start_owned(run_id, spec).await })
+        // `None` is nagoya's JoinError: the pool went away before the task
+        // could finish. A panic inside is rethrown here rather than returned,
+        // where tokio returned it as an error, but provider starts do not
+        // panic by design and a panic is a bug either way.
+        self.spawn(async move { registry.start_owned(run_id, spec).await })
             .await
-            .map_err(|error| RuntimeError::Start(format!("proxy runtime stopped: {error}")))?
+            .ok_or_else(|| RuntimeError::Start("proxy runtime stopped".into()))?
     }
 
     async fn start_owned(&self, run_id: RunId, spec: RunRequest) -> Result<(), RuntimeError> {
@@ -225,12 +260,12 @@ impl RuntimeRegistry {
             return Err(RuntimeError::Conflict);
         }
         let request = build_request(spec.clone())?;
-        let mut run = agent_abstraction::stream(&request)
+        let mut run = agent_abstraction::stream(&request, &self.reactor)
             .map_err(|error| RuntimeError::Start(error.to_string()))?;
         let control = run.control();
         let (events, _) = broadcast::channel(256);
         let (cancel, mut cancelled) = oneshot::channel();
-        let (completed, _) = watch::channel(false);
+        let completed = Arc::new(Flag::default());
         let snapshot = RunSnapshot {
             run_id: run_id.clone(),
             state: RunState::Starting,
@@ -263,31 +298,36 @@ impl RuntimeRegistry {
         }
 
         let registry = self.clone();
-        self.executor.spawn(async move {
+        // Detached, as tokio's spawn was: the run outlives the request that
+        // started it and ends on its own terminal event or on cancellation.
+        drop(self.spawn(async move {
             loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut cancelled => {
-                        // Cooperative cancellation gives interactive providers
-                        // their protocol-level interrupt before the abstraction's
-                        // bounded process-group fallback. Dropping this handle
-                        // skipped Codex `turn/interrupt`, leaving the server-owned
-                        // turn alive after AgencyProxy reported it canceled.
-                        let _ = run.cancel().await;
-                        registry
-                            .publish_error(
-                                &run_id,
-                                "the run was canceled".into(),
-                                RunState::Canceled,
-                            )
-                            .await;
-                        return;
-                    }
-                    event = run.recv() => {
-                        let Some(event) = event else { break };
-                        registry.publish_provider(&run_id, event).await;
-                    }
-                }
+                // `select` polls its first argument first, which is the
+                // `biased;` ordering the tokio version asked for: a pending
+                // cancellation wins over an event that is ready at the same
+                // time. The cancellation receiver is borrowed, so losing to an
+                // event leaves it armed for the next turn; the `recv` future is
+                // dropped at the end of this statement either way, which frees
+                // `run` for `cancel` below. A dropped sender resolves the
+                // receiver too, exactly as `&mut cancelled` did under tokio.
+                let event = match select(&mut cancelled, pin!(run.recv())).await {
+                    Either::Left(_) => None,
+                    Either::Right((event, _)) => Some(event),
+                };
+                let Some(event) = event else {
+                    // Cooperative cancellation gives interactive providers
+                    // their protocol-level interrupt before the abstraction's
+                    // bounded process-group fallback. Dropping this handle
+                    // skipped Codex `turn/interrupt`, leaving the server-owned
+                    // turn alive after AgencyProxy reported it canceled.
+                    let _ = run.cancel().await;
+                    registry
+                        .publish_error(&run_id, "the run was canceled".into(), RunState::Canceled)
+                        .await;
+                    return;
+                };
+                let Some(event) = event else { break };
+                registry.publish_provider(&run_id, event).await;
             }
             match run.finish().await {
                 Ok(outcome) => {
@@ -304,7 +344,7 @@ impl RuntimeRegistry {
                         .await
                 }
             }
-        });
+        }));
         Ok(())
     }
 
@@ -388,14 +428,14 @@ impl RuntimeRegistry {
     }
 
     pub async fn cancel(&self, run_id: &RunId) -> Result<(), RuntimeError> {
-        // Subscribe before delivering cancellation. A fast provider can emit
-        // its terminal event in the same scheduling turn; installing the
-        // receiver first makes the acknowledgement race-free.
+        // Take the completion flag before delivering cancellation. A fast
+        // provider can emit its terminal event in the same scheduling turn;
+        // the flag stays set once set, so the acknowledgement is race-free.
         let (cancel, completed) = {
             let mut runs = self.runs.write().await;
             let run = runs.get_mut(run_id).ok_or(RuntimeError::NotFound)?;
             let cancel = run.cancel.take().ok_or(RuntimeError::Conflict)?;
-            (cancel, run.completed.subscribe())
+            (cancel, Arc::clone(&run.completed))
         };
         let _ = cancel.send(());
         wait_until_completed(completed).await;
@@ -420,7 +460,7 @@ impl RuntimeRegistry {
         if let Some(binary) = binary.filter(|value| !value.is_empty()) {
             request = request.bin(binary);
         }
-        interrupt(&request)
+        interrupt(&request, &self.reactor)
             .await
             .map_err(|error| RuntimeError::Control(error.to_string()))
     }
@@ -575,18 +615,14 @@ impl RuntimeRegistry {
         push_journal(&mut run.journal, &mut run.replay_floor, event.clone());
         let _ = run.events.send(event);
         if finished {
-            run.completed.send_replace(true);
+            run.completed.set();
             self.activity.finished();
         }
     }
 }
 
-async fn wait_until_completed(mut completed: watch::Receiver<bool>) {
-    while !*completed.borrow_and_update() {
-        if completed.changed().await.is_err() {
-            break;
-        }
-    }
+async fn wait_until_completed(completed: Arc<Flag>) {
+    completed.wait().await;
 }
 
 fn is_active_state(state: &RunState) -> bool {
@@ -716,48 +752,63 @@ mod tests {
         assert_eq!(journal.front().map(|event| event.sequence), Some(4));
     }
 
-    #[tokio::test]
-    async fn activity_waits_for_the_last_run_without_polling() {
-        let activity = RunActivity::default();
-        activity.started();
-        activity.started();
+    /// Long enough for the shared pool to have polled a freshly spawned task.
+    ///
+    /// The tokio tests ran on a current-thread runtime, where one `yield_now`
+    /// guaranteed the spawned waiter had been polled. nagoya's pool runs it on
+    /// another thread, so a yield on this one proves nothing about it; a short
+    /// sleep gives it time to park. The assertions only ever check that the
+    /// waiter has *not* finished, so a slow pool cannot make them flaky.
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
 
-        let waiter = tokio::spawn({
-            let activity = activity.clone();
-            async move { activity.wait_until_idle().await }
+    #[test]
+    fn activity_waits_for_the_last_run_without_polling() {
+        nagoya::block_on(async {
+            let activity = RunActivity::default();
+            activity.started();
+            activity.started();
+
+            let waiter = nagoya::spawn({
+                let activity = activity.clone();
+                async move { activity.wait_until_idle().await }
+            });
+            nagoya::sleep(SETTLE).await;
+            assert!(!waiter.is_finished());
+
+            activity.finished();
+            nagoya::sleep(SETTLE).await;
+            assert!(!waiter.is_finished());
+
+            activity.finished();
+            waiter.await.expect("the waiter should run to completion");
+            assert_eq!(activity.count(), 0);
         });
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-
-        activity.finished();
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-
-        activity.finished();
-        waiter.await.unwrap();
-        assert_eq!(activity.count(), 0);
     }
 
-    #[tokio::test]
-    async fn activity_wait_returns_immediately_when_idle() {
-        RunActivity::default().wait_until_idle().await;
+    #[test]
+    fn activity_wait_returns_immediately_when_idle() {
+        nagoya::block_on(RunActivity::default().wait_until_idle());
     }
 
-    #[tokio::test]
-    async fn completion_wait_observes_a_signal_without_polling() {
-        let (completed, receiver) = watch::channel(false);
-        let waiter = tokio::spawn(wait_until_completed(receiver));
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
+    #[test]
+    fn completion_wait_observes_a_signal_without_polling() {
+        nagoya::block_on(async {
+            let completed = Arc::new(Flag::default());
+            let waiter = nagoya::spawn(wait_until_completed(Arc::clone(&completed)));
+            nagoya::sleep(SETTLE).await;
+            assert!(!waiter.is_finished());
 
-        completed.send_replace(true);
-        waiter.await.unwrap();
+            completed.set();
+            waiter.await.expect("the waiter should run to completion");
+        });
     }
 
-    #[tokio::test]
-    async fn completion_wait_returns_immediately_after_the_signal() {
-        let (completed, receiver) = watch::channel(false);
-        completed.send_replace(true);
-        wait_until_completed(receiver).await;
+    #[test]
+    fn completion_wait_returns_immediately_after_the_signal() {
+        nagoya::block_on(async {
+            let completed = Arc::new(Flag::default());
+            completed.set();
+            wait_until_completed(completed).await;
+        });
     }
 }
