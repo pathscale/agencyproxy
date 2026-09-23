@@ -22,9 +22,9 @@ use thiserror::Error;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-pub use config::{ConfigError, ConnectionConfig, ProxyConfig, TlsConfig};
+pub use config::{ConfigError, ConnectionConfig, ProxyConfig};
 pub use runtime::{Attachment, RuntimeError, RuntimeRegistry, SequencedEvent};
-pub use web::{WebSocketConfig, WebSocketTlsConfig, serve_websocket};
+pub use web::{WebSocketConfig, serve_websocket};
 
 #[derive(Debug, Error)]
 pub enum Error {

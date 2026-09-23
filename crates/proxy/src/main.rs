@@ -1,6 +1,5 @@
 use agency_proxy::{
-    ConnectionConfig, ProxyConfig, ProxyServer, RuntimeRegistry, WebSocketConfig,
-    WebSocketTlsConfig, serve_websocket,
+    ConnectionConfig, ProxyConfig, ProxyServer, RuntimeRegistry, WebSocketConfig, serve_websocket,
 };
 use clap::Parser;
 use std::{path::PathBuf, process::ExitCode};
@@ -42,24 +41,34 @@ async fn main() -> ExitCode {
             address,
             authentication_key,
             allowed_origins,
-            tls,
-        } => {
-            eprintln!("AgencyProxy MCP/WebSocket listening on {address}");
-            serve_websocket(
-                registry,
-                WebSocketConfig {
-                    address,
-                    authentication_key,
-                    allowed_origins,
-                    tls: tls.map(|tls| WebSocketTlsConfig {
-                        certificates: tls.certificates,
-                        private_key: tls.private_key,
-                    }),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())
-        }
+        } => match termination() {
+            Err(error) => Err(format!("could not register SIGTERM and SIGINT: {error}")),
+            Ok(terminated) => {
+                eprintln!("AgencyProxy MCP/WebSocket listening on {address}");
+                // The process owns its signals and tells the server when to stop.
+                // The server polls `stop` on its own thread, where tokio's signal
+                // driver does not reach, so the signal is waited for here and
+                // forwarded through a oneshot, which needs no runtime to await.
+                let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+                tokio::spawn(async move {
+                    terminated.await;
+                    let _ = stop.send(());
+                });
+                serve_websocket(
+                    registry,
+                    WebSocketConfig {
+                        address,
+                        authentication_key,
+                        allowed_origins,
+                    },
+                    async move {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -68,6 +77,22 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Resolves on the first SIGTERM or SIGINT.
+///
+/// Both are registered before this returns, so a signal that arrives while the
+/// server is still binding is not lost to the default action.
+fn termination() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
 }
 
 async fn serve_unix(socket: PathBuf, registry: RuntimeRegistry) -> Result<(), String> {

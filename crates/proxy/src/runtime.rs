@@ -113,6 +113,19 @@ pub enum RuntimeError {
 }
 
 impl RuntimeRegistry {
+    /// Run `future` on the runtime that owns this registry's provider tasks.
+    ///
+    /// For work started from a transport whose own executor is not tokio's,
+    /// such as an endpoint-libs WebSocket handler, which is polled on that
+    /// server's reactor and can neither `spawn_local` nor reach tokio's timers.
+    pub(crate) fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.executor.spawn(future)
+    }
+
     pub async fn account_usage(&self) -> Vec<agency_proxy_protocol::ProviderAccountUsage> {
         futures::future::join_all(
             [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Grok].map(|agent| async move {

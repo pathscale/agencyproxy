@@ -56,8 +56,10 @@ async fn authenticated_websocket_serves_the_minimal_mcp_surface() {
             address,
             authentication_key: KEY.into(),
             allowed_origins: vec!["https://agencyzero.example".into()],
-            tls: None,
         },
+        // Each test's server lives until the test process exits. None of them
+        // takes a signal, which is what lets several run in one process.
+        std::future::pending(),
     ));
 
     let mut request = format!("ws://{address}")
@@ -167,8 +169,10 @@ async fn websocket_rejects_clients_without_the_configured_key() {
             address,
             authentication_key: KEY.into(),
             allowed_origins: vec!["https://agencyzero.example".into()],
-            tls: None,
         },
+        // Each test's server lives until the test process exits. None of them
+        // takes a signal, which is what lets several run in one process.
+        std::future::pending(),
     ));
     let mut request = format!("ws://{address}")
         .into_client_request()
@@ -469,8 +473,10 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
             address,
             authentication_key: KEY.into(),
             allowed_origins: vec!["https://agencyzero.example".into()],
-            tls: None,
         },
+        // Each test's server lives until the test process exits. None of them
+        // takes a signal, which is what lets several run in one process.
+        std::future::pending(),
     ));
     let mut request = format!("ws://{address}")
         .into_client_request()
