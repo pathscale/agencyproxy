@@ -36,4 +36,4 @@ jobs:
           cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test
