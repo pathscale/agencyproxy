@@ -25,16 +25,7 @@ pub enum ConnectionConfig {
         authentication_key: String,
         #[serde(default)]
         allowed_origins: Vec<String>,
-        #[serde(default)]
-        tls: Option<TlsConfig>,
     },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TlsConfig {
-    pub certificates: Vec<PathBuf>,
-    pub private_key: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -66,7 +57,6 @@ impl ProxyConfig {
             address,
             authentication_key,
             allowed_origins,
-            tls: _,
         } = &self.connection
         else {
             return Ok(());
@@ -119,7 +109,6 @@ mod tests {
                 address: "0.0.0.0:17820".parse().expect("address should parse"),
                 authentication_key: KEY.into(),
                 allowed_origins: Vec::new(),
-                tls: None,
             },
         };
         assert!(matches!(
@@ -132,7 +121,6 @@ mod tests {
                 address: "127.0.0.1:17820".parse().expect("address should parse"),
                 authentication_key: "short".into(),
                 allowed_origins: Vec::new(),
-                tls: None,
             },
         };
         assert!(matches!(

@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -36,13 +35,6 @@ pub struct WebSocketConfig {
     pub address: SocketAddr,
     pub authentication_key: String,
     pub allowed_origins: Vec<String>,
-    pub tls: Option<WebSocketTlsConfig>,
-}
-
-#[derive(Clone, Debug)]
-pub struct WebSocketTlsConfig {
-    pub certificates: Vec<PathBuf>,
-    pub private_key: PathBuf,
 }
 
 struct Authentication {
@@ -71,21 +63,66 @@ impl AuthController for Authentication {
     }
 }
 
-pub async fn serve_websocket(
+/// Serve MCP over WebSocket until `stop` resolves, then drain accepted runs.
+///
+/// `stop` is the caller's, not a signal this function takes. endpoint-libs'
+/// `listen` would claim SIGTERM and SIGINT for the process, and a second server
+/// in the same process then fails with `EBUSY`; signals belong to `main`. `stop`
+/// is polled on the server's own thread, so it must not need tokio: a oneshot
+/// receiver is the intended shape.
+pub async fn serve_websocket<S>(
     registry: RuntimeRegistry,
     config: WebSocketConfig,
-) -> eyre::Result<()> {
+    stop: S,
+) -> eyre::Result<()>
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
     let drain_registry = registry.clone();
-    let (insecure, pub_certs, priv_key) = match config.tls {
-        Some(tls) => (false, Some(tls.certificates), Some(tls.private_key)),
-        None => (true, None, None),
-    };
+    // The server blocks the thread it runs on: it owns a reactor and polls it
+    // until `stop`. On a tokio worker that held the worker for the life of the
+    // process, and on a current-thread runtime, which every test uses, it held
+    // the only one. It gets a thread of its own, and this future waits for its
+    // answer without blocking.
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("agency-proxy-websocket".into())
+        .spawn(move || {
+            let _ = answer.send(listen_websocket(registry, config, stop));
+        })?;
+    let result = answered.await.unwrap_or_else(|_| {
+        Err(eyre::eyre!(
+            "the WebSocket server thread ended without a result"
+        ))
+    });
+    let active = drain_registry.active_count().await;
+    if active > 0 {
+        eprintln!("AgencyProxy WebSocket admission closed; draining {active} active run(s)");
+    }
+    // endpoint-libs closes admission before returning from `listen` on TERM.
+    // Keep the process alive until every provider already accepted by this
+    // registry settles, matching the Unix transport's drain restart contract.
+    drain_registry.wait_until_idle().await;
+    if active > 0 {
+        eprintln!("AgencyProxy WebSocket runs drained");
+    }
+    result
+}
+
+fn listen_websocket<S>(
+    registry: RuntimeRegistry,
+    config: WebSocketConfig,
+    stop: S,
+) -> eyre::Result<()>
+where
+    S: std::future::Future<Output = ()> + 'static,
+{
+    let drain_registry = registry.clone();
+    // Plain ws:// only. The listener is loopback by validation, and
+    // endpoint-libs 3 refuses certificates outright: TLS terminates at the edge.
     let mut server = WebsocketServer::new(WsServerConfig {
         name: "agency-proxy".into(),
         address: config.address.to_string(),
-        insecure,
-        pub_certs,
-        priv_key,
         allow_cors_urls: Arc::new(Some(config.allowed_origins)),
         drop_conn_on_buffer_full: true,
         mcp_only: true,
@@ -117,22 +154,7 @@ pub async fn serve_websocket(
             version: env!("CARGO_PKG_VERSION").into(),
         },
     )?;
-    // `listen` blocks until a signal arrives in endpoint-libs 3: it builds its
-    // own reactor, registers SIGTERM and SIGINT on it, and returns when either
-    // fires.
-    let result = server.listen();
-    let active = drain_registry.active_count().await;
-    if active > 0 {
-        eprintln!("AgencyProxy WebSocket admission closed; draining {active} active run(s)");
-    }
-    // endpoint-libs closes admission before returning from `listen` on TERM.
-    // Keep the process alive until every provider already accepted by this
-    // registry settles, matching the Unix transport's drain restart contract.
-    drain_registry.wait_until_idle().await;
-    if active > 0 {
-        eprintln!("AgencyProxy WebSocket runs drained");
-    }
-    result
+    server.listen_until(stop)
 }
 
 type SubscriptionKey = (ConnectionId, String);
@@ -392,7 +414,11 @@ impl RequestHandler for MethodSubscribeRun {
         let registry = self.registry.clone();
         let toolbox = TOOLBOX.with(Arc::clone);
         let connection_id = ctx.connection_id;
-        let task = tokio::task::spawn_local(async move {
+        // On the registry's runtime, not the connection's. endpoint-libs 3 polls
+        // a handler in place on the connection task and has no spawner, and
+        // `spawn_local` needs a tokio LocalSet this thread no longer has. The
+        // forwarder needs nothing thread-bound: the toolbox is `Send + Sync`.
+        let task = self.registry.spawn(async move {
             forward_run_events(
                 registry,
                 toolbox,
