@@ -8,7 +8,6 @@ on:
     branches: [master]
     paths:
       - Cargo.toml
-      - Cargo.lock
       - crates/**
   workflow_dispatch:
     inputs:

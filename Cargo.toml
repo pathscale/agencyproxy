@@ -11,11 +11,11 @@ homepage = "https://github.com/pathscale/agencyproxy"
 repository = "https://github.com/pathscale/agencyproxy"
 
 [workspace.dependencies]
-agency-proxy-protocol = { version = "^0.1.9", path = "crates/protocol" }
-agency-proxy-client = { version = "^0.1.9", path = "crates/client" }
+agency-proxy-protocol = { version = "^0.1", path = "crates/protocol" }
+agency-proxy-client = { version = "^0.1", path = "crates/client" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
-endpoint-libs = { version = "^3.3", default-features = false, features = ["framed-transport"] }
+endpoint-libs = { version = "^3", default-features = false, features = ["framed-transport"] }
 eyre = "0.6"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
