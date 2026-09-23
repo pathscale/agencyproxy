@@ -9,24 +9,25 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio-util = { version = "^0.7", features = ["compat"] }
-agent-abstraction = "^0.4"
+agent-abstraction = "^0.5"
 agency-proxy-protocol.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 endpoint-libs = { workspace = true, features = ["ws-http1"] }
 eyre.workspace = true
 futures.workspace = true
+nagoya.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 
 [dev-dependencies]
 agency-proxy-client.workspace = true
+# The WebSocket client the MCP tests drive the server with: nago-wss over a
+# nagoya socket, the same stack the server speaks, and no tokio.
+endpoint-libs = { workspace = true, features = ["ws-client"] }
 libc = "0.2"
 tempfile = "3"
-tokio-tungstenite = "0.29"
 
 [[bin]]
 name = "agency-proxy"

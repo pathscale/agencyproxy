@@ -45,8 +45,13 @@ pub enum ConfigError {
 }
 
 impl ProxyConfig {
+    /// Read and validate the config file.
+    ///
+    /// A blocking `std::fs::read`: this is one small file read once at
+    /// startup, before any socket exists, so there is nothing for it to stall.
+    /// It stays `async` so callers do not change.
     pub async fn read(path: &std::path::Path) -> Result<Self, ConfigError> {
-        let bytes = tokio::fs::read(path).await.map_err(ConfigError::Read)?;
+        let bytes = std::fs::read(path).map_err(ConfigError::Read)?;
         let config: Self = serde_json::from_slice(&bytes).map_err(ConfigError::Parse)?;
         config.validate()?;
         Ok(config)

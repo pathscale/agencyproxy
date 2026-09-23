@@ -17,7 +17,11 @@ use endpoint_libs::{
     },
     model::TypeRegistry,
 };
-use futures::{FutureExt, future::LocalBoxFuture};
+use futures::{
+    FutureExt,
+    channel::oneshot,
+    future::{AbortHandle, LocalBoxFuture, abortable},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -68,8 +72,9 @@ impl AuthController for Authentication {
 /// `stop` is the caller's, not a signal this function takes. endpoint-libs'
 /// `listen` would claim SIGTERM and SIGINT for the process, and a second server
 /// in the same process then fails with `EBUSY`; signals belong to `main`. `stop`
-/// is polled on the server's own thread, so it must not need tokio: a oneshot
-/// receiver is the intended shape.
+/// is polled on the server's own thread, under that server's own reactor, so it
+/// must not need any other runtime: a `futures` oneshot receiver is the
+/// intended shape.
 pub async fn serve_websocket<S>(
     registry: RuntimeRegistry,
     config: WebSocketConfig,
@@ -80,11 +85,11 @@ where
 {
     let drain_registry = registry.clone();
     // The server blocks the thread it runs on: it owns a reactor and polls it
-    // until `stop`. On a tokio worker that held the worker for the life of the
-    // process, and on a current-thread runtime, which every test uses, it held
-    // the only one. It gets a thread of its own, and this future waits for its
-    // answer without blocking.
-    let (answer, answered) = tokio::sync::oneshot::channel();
+    // until `stop`. On a pool worker that would hold the worker for the life
+    // of the process, and inside `nagoya::block_on`, which `main` and every
+    // test use, it would hold the only thread. It gets a thread of its own,
+    // and this future waits for its answer without blocking.
+    let (answer, answered) = oneshot::channel();
     std::thread::Builder::new()
         .name("agency-proxy-websocket".into())
         .spawn(move || {
@@ -159,9 +164,15 @@ where
 
 type SubscriptionKey = (ConnectionId, String);
 
+/// Live run-event forwarders, one per connection and run.
+///
+/// The handles are `futures` abort handles. tokio's `AbortHandle` came from
+/// the spawned task; nagoya's `JoinHandle` has no detachable abort handle, so
+/// the forwarder is wrapped in `abortable` before it is spawned. Aborting stops
+/// it at its next suspension point, as tokio's did.
 #[derive(Clone, Default)]
 struct RunSubscriptions {
-    active: Arc<Mutex<HashMap<SubscriptionKey, (u64, tokio::task::AbortHandle)>>>,
+    active: Arc<Mutex<HashMap<SubscriptionKey, (u64, AbortHandle)>>>,
     next_generation: Arc<AtomicU64>,
 }
 
@@ -170,7 +181,7 @@ impl RunSubscriptions {
         self.next_generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    fn insert(&self, key: SubscriptionKey, generation: u64, handle: tokio::task::AbortHandle) {
+    fn insert(&self, key: SubscriptionKey, generation: u64, handle: AbortHandle) {
         if let Ok(mut active) = self.active.lock()
             && let Some((_, previous)) = active.insert(key, (generation, handle))
         {
@@ -414,11 +425,11 @@ impl RequestHandler for MethodSubscribeRun {
         let registry = self.registry.clone();
         let toolbox = TOOLBOX.with(Arc::clone);
         let connection_id = ctx.connection_id;
-        // On the registry's runtime, not the connection's. endpoint-libs 3 polls
-        // a handler in place on the connection task and has no spawner, and
-        // `spawn_local` needs a tokio LocalSet this thread no longer has. The
-        // forwarder needs nothing thread-bound: the toolbox is `Send + Sync`.
-        let task = self.registry.spawn(async move {
+        // On the registry's pool, not the connection's thread. endpoint-libs 3
+        // polls a handler in place on the connection task and has no spawner.
+        // The forwarder needs nothing thread-bound: the toolbox is
+        // `Send + Sync`.
+        let (forward, abort) = abortable(async move {
             forward_run_events(
                 registry,
                 toolbox,
@@ -430,9 +441,13 @@ impl RequestHandler for MethodSubscribeRun {
             .await;
             subscriptions.remove_if_current(&cleanup_key, generation);
         });
-        self.subscriptions
-            .insert(key, generation, task.abort_handle());
-        drop(task);
+        // Registered before the forwarder is spawned. The tokio version could
+        // only take the abort handle from the spawned task, so a forwarder
+        // that finished at once ran its cleanup before it was registered and
+        // left a stale entry behind until disconnect; this order cannot.
+        self.subscriptions.insert(key, generation, abort);
+        // Detached; the abort handle is how it is stopped.
+        drop(self.registry.spawn(forward));
 
         Ok(SubscribeRunResponse {
             run: attachment.snapshot,
@@ -447,7 +462,7 @@ async fn forward_run_events(
     connection_id: ConnectionId,
     run_id: RunId,
     mut last_sequence: u64,
-    mut events: tokio::sync::broadcast::Receiver<crate::SequencedEvent>,
+    mut events: crate::broadcast::Receiver<crate::SequencedEvent>,
 ) {
     loop {
         match events.recv().await {
@@ -460,7 +475,7 @@ async fn forward_run_events(
                     return;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            Err(crate::broadcast::RecvError::Lagged(_)) => {
                 let Ok(attachment) = registry.attach(&run_id, last_sequence).await else {
                     return;
                 };
@@ -475,7 +490,7 @@ async fn forward_run_events(
                 }
                 events = attachment.events;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            Err(crate::broadcast::RecvError::Closed) => return,
         }
     }
 }

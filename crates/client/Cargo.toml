@@ -9,10 +9,9 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio-util = { version = "^0.7", features = ["compat"] }
 agency-proxy-protocol.workspace = true
 endpoint-libs.workspace = true
 futures.workspace = true
+nagoya.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
