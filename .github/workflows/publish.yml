@@ -1,8 +1,8 @@
 name: Publish
 
-# Publish on a version bump, not on every push to master. Source paths are
-# included so a re-run after a transient registry failure does not need a
-# dummy version change. Existing versions exit cleanly.
+# Dispatch manually on the intended ref after bumping the workspace version.
+# Enable dry_run to test and package without uploading. A failed release can
+# be dispatched again without a dummy version change.
 on:
   workflow_dispatch:
     inputs:
