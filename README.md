@@ -50,6 +50,17 @@ for local development, but an HTTPS-hosted frontend should use the configured
 certificate and connect with `wss://`. Browser clients authenticate with the
 WebSocket subprotocol `agency-proxy.<authenticationKey>`.
 
+For a credential-bearing config, send its JSON over stdin instead of saving it
+in a file:
+
+```sh
+your-secret-provider render-config | agency-proxy --config -
+```
+
+`--config -` reads JSON to EOF from stdin and validates it before opening a
+socket. The secret provider command above is a placeholder; use the approved
+provider for the environment. Do not put config values in command arguments.
+
 ## Publishing
 
 The three crates share the workspace version. A merge to `master` that changes
