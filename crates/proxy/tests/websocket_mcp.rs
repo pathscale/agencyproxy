@@ -6,6 +6,7 @@ use endpoint_libs::libs::ws::{WsClient, WsClientBuilder};
 use nagoya::reactor::{Handle, Reactor};
 use serde_json::{Value, json};
 use std::{
+    io::Write,
     net::TcpListener,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -14,6 +15,23 @@ use tempfile::tempdir;
 
 const KEY: &str = "0123456789abcdef0123456789abcdef";
 const ORIGIN: &str = "https://agencyzero.example";
+
+fn spawn_proxy_with_config(config: String) -> std::process::Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agency-proxy"))
+        .arg("--config")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start agency-proxy");
+    let mut stdin = child.stdin.take().expect("stdin was not piped");
+    stdin
+        .write_all(config.as_bytes())
+        .expect("failed to send configuration");
+    drop(stdin);
+    child
+}
 
 fn unused_loopback_address() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
@@ -223,28 +241,16 @@ fn release_cli_starts_the_configured_websocket_transport() {
     let handle = reactor.handle();
     nagoya::block_on(async {
         let address = unused_loopback_address();
-        let dir = tempdir().expect("temporary config directory should exist");
-        let config_path = dir.path().join("agency-proxy.json");
-        std::fs::write(
-            &config_path,
-            json!({
-                "connection": {
-                    "type": "web_socket",
-                    "address": address.to_string(),
-                    "authenticationKey": KEY,
-                    "allowedOrigins": [ORIGIN]
-                }
-            })
-            .to_string(),
-        )
-        .expect("config should write");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_agency-proxy"))
-            .arg("--config")
-            .arg(&config_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("AgencyProxy should launch");
+        let config = json!({
+            "connection": {
+                "type": "web_socket",
+                "address": address.to_string(),
+                "authenticationKey": KEY,
+                "allowedOrigins": [ORIGIN]
+            }
+        })
+        .to_string();
+        let mut child = spawn_proxy_with_config(config);
 
         let mut socket = None;
         for _ in 0..100 {
@@ -306,27 +312,16 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         .expect("fake provider should write");
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700))
             .expect("fake provider should be executable");
-        let config_path = dir.path().join("agency-proxy.json");
-        std::fs::write(
-            &config_path,
-            json!({
-                "connection": {
-                    "type": "web_socket",
-                    "address": address.to_string(),
-                    "authenticationKey": KEY,
-                    "allowedOrigins": [ORIGIN]
-                }
-            })
-            .to_string(),
-        )
-        .expect("config should write");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_agency-proxy"))
-            .arg("--config")
-            .arg(&config_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("AgencyProxy should launch");
+        let config = json!({
+            "connection": {
+                "type": "web_socket",
+                "address": address.to_string(),
+                "authenticationKey": KEY,
+                "allowedOrigins": [ORIGIN]
+            }
+        })
+        .to_string();
+        let mut child = spawn_proxy_with_config(config);
 
         let mut socket = None;
         for _ in 0..100 {

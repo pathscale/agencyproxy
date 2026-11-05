@@ -45,13 +45,22 @@ pub enum ConfigError {
 }
 
 impl ProxyConfig {
-    /// Read and validate the config file.
+    /// Read and validate the config file, or stdin when `path` is `-`.
     ///
-    /// A blocking `std::fs::read`: this is one small file read once at
-    /// startup, before any socket exists, so there is nothing for it to stall.
+    /// This is one small blocking read once at startup, before any socket
+    /// exists, so there is nothing for it to stall.
     /// It stays `async` so callers do not change.
     pub async fn read(path: &std::path::Path) -> Result<Self, ConfigError> {
-        let bytes = std::fs::read(path).map_err(ConfigError::Read)?;
+        let bytes = if path == std::path::Path::new("-") {
+            use std::io::Read as _;
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let mut bytes = Vec::new();
+            input.read_to_end(&mut bytes).map_err(ConfigError::Read)?;
+            bytes
+        } else {
+            std::fs::read(path).map_err(ConfigError::Read)?
+        };
         let config: Self = serde_json::from_slice(&bytes).map_err(ConfigError::Parse)?;
         config.validate()?;
         Ok(config)
