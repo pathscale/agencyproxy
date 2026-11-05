@@ -63,8 +63,12 @@ provider for the environment. Do not put config values in command arguments.
 
 ## Publishing
 
-The three crates share the workspace version. A merge to `master` that changes
-the root `Cargo.toml` runs the full CI checks, then publishes any missing crates
-in dependency order: protocol, client, and daemon. The repository must provide
-an Actions secret named `CARGO_REGISTRY_TOKEN` with permission to publish all
-three crates.
+The three crates share the workspace version in the root `Cargo.toml`; bump it
+before publishing changed crate behavior. Both hosted workflows run manually
+from the Actions tab. Select the intended ref and run **CI** for formatting,
+Clippy, and tests. After those checks pass, run **Publish** on the same ref with
+`dry_run` enabled to test and package without uploading. To release, run
+**Publish** again on that ref with `dry_run` disabled; it runs release tests and
+invokes `cargo publish --workspace`. Merging to `master` does not start either
+workflow. The repository must provide an Actions secret named
+`CARGO_REGISTRY_TOKEN` with permission to publish all three crates.
