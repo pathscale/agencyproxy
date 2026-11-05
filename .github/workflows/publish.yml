@@ -4,11 +4,6 @@ name: Publish
 # included so a re-run after a transient registry failure does not need a
 # dummy version change. Existing versions exit cleanly.
 on:
-  push:
-    branches: [master]
-    paths:
-      - Cargo.toml
-      - crates/**
   workflow_dispatch:
     inputs:
       dry_run:
