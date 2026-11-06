@@ -36,18 +36,14 @@ select the transport instead:
     "type": "web_socket",
     "address": "127.0.0.1:17820",
     "authenticationKey": "replace-with-at-least-32-url-safe-characters",
-    "allowedOrigins": ["https://agencyzero.example"],
-    "tls": {
-      "certificates": ["/path/to/localhost-cert.pem"],
-      "privateKey": "/path/to/localhost-key.pem"
-    }
+    "allowedOrigins": ["https://agencyzero.example"]
   }
 }
 ```
 
-Run it with `agency-proxy --config /path/to/agency-proxy.json`. TLS is optional
-for local development, but an HTTPS-hosted frontend should use the configured
-certificate and connect with `wss://`. Browser clients authenticate with the
+Run it with `agency-proxy --config /path/to/agency-proxy.json`. The WebSocket
+listener serves plain `ws://`; terminate TLS at a trusted edge proxy when an
+HTTPS-hosted frontend needs `wss://`. Browser clients authenticate with the
 WebSocket subprotocol `agency-proxy.<authenticationKey>`.
 
 For a credential-bearing config, send its JSON over stdin instead of saving it
