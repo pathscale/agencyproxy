@@ -1,5 +1,6 @@
 use agency_proxy::{
-    ConnectionConfig, ProxyConfig, ProxyServer, RuntimeRegistry, WebSocketConfig, serve_websocket,
+    ConfigError, ConnectionConfig, ProxyConfig, ProxyServer, RuntimeRegistry, WebSocketConfig,
+    serve_websocket,
 };
 use clap::Parser;
 use futures::{channel::oneshot, future::select};
@@ -33,7 +34,10 @@ fn main() -> ExitCode {
         Some(path) => match nagoya::block_on(ProxyConfig::read(&path)) {
             Ok(config) => config,
             Err(error) => {
-                eprintln!("could not start AgencyProxy: {error}");
+                eprintln!(
+                    "could not start AgencyProxy: {}",
+                    config_error_message(error)
+                );
                 return ExitCode::FAILURE;
             }
         },
@@ -72,6 +76,30 @@ fn main() -> ExitCode {
             eprintln!("AgencyProxy stopped: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn config_error_message(error: ConfigError) -> String {
+    match error {
+        ConfigError::Parse(error) => {
+            let category = match error.classify() {
+                serde_json::error::Category::Io => "I/O",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "EOF",
+            };
+            let line = error.line();
+            let column = error.column();
+            if line > 0 && column > 0 {
+                format!("invalid config JSON ({category} error at line {line}, column {column})")
+            } else {
+                format!("invalid config JSON ({category} error)")
+            }
+        }
+        ConfigError::InvalidOrigin(_) => {
+            "allowed WebSocket origins must begin with http:// or https://".into()
+        }
+        error => error.to_string(),
     }
 }
 
