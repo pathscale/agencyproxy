@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use std::{
     io::Write,
     net::TcpListener,
-    process::{Command, Stdio},
+    path::Path,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 use tempfile::tempdir;
@@ -16,21 +18,147 @@ use tempfile::tempdir;
 const KEY: &str = "0123456789abcdef0123456789abcdef";
 const ORIGIN: &str = "https://agencyzero.example";
 
-fn spawn_proxy_with_config(config: String) -> std::process::Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agency-proxy"))
-        .arg("--config")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to start agency-proxy");
-    let mut stdin = child.stdin.take().expect("stdin was not piped");
+struct ChildGuard {
+    child: Child,
+}
+
+impl ChildGuard {
+    fn wait_for_exit(&mut self, timeout: Duration) -> std::io::Result<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "AgencyProxy child did not exit before the deadline",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10).min(remaining));
+        }
+    }
+}
+
+impl ChildGuard {
+    fn terminate_and_reap(&mut self) -> std::io::Result<()> {
+        match self.child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(_) => {}
+        }
+
+        if let Err(kill_error) = self.child.kill() {
+            // `kill` can lose a race with natural exit. Recheck before
+            // reporting its error; otherwise leave cleanup bounded.
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return Ok(());
+            }
+            return Err(kill_error);
+        }
+
+        self.wait_for_exit(Duration::from_secs(1)).map(|_| ())
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.terminate_and_reap() {
+            // Drop also runs while unwinding. Write best-effort so cleanup
+            // failures are visible without risking a second panic.
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "failed to terminate/reap AgencyProxy child during cleanup: {error}"
+            );
+        }
+    }
+}
+
+fn spawn_proxy_with_config(config: String) -> ChildGuard {
+    let mut child = ChildGuard {
+        child: Command::new(env!("CARGO_BIN_EXE_agency-proxy"))
+            .arg("--config")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to start agency-proxy"),
+    };
+    let mut stdin = child.child.stdin.take().expect("stdin was not piped");
     stdin
         .write_all(config.as_bytes())
         .expect("failed to send configuration");
     drop(stdin);
     child
+}
+
+fn spawn_proxy_with_file_config(path: &Path, stderr: Stdio) -> ChildGuard {
+    ChildGuard {
+        child: Command::new(env!("CARGO_BIN_EXE_agency-proxy"))
+            .arg("--config")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .expect("failed to start agency-proxy"),
+    }
+}
+
+fn spawn_proxy_with_stdin_config_and_stderr(config: &str, stderr: Stdio) -> ChildGuard {
+    let mut child = ChildGuard {
+        child: Command::new(env!("CARGO_BIN_EXE_agency-proxy"))
+            .arg("--config")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .expect("failed to start agency-proxy"),
+    };
+    let mut stdin = child.child.stdin.take().expect("stdin was not piped");
+    stdin
+        .write_all(config.as_bytes())
+        .expect("failed to send configuration");
+    drop(stdin);
+    child
+}
+
+fn assert_cli_config_error_is_redacted(
+    config: &str,
+    marker: &str,
+    expected_diagnostic: &str,
+    explicit_file: bool,
+) {
+    let directory = tempdir().expect("temporary test scratch should exist");
+    let stderr_path = directory.path().join("stderr.log");
+    let stderr = Stdio::from(
+        std::fs::File::create(&stderr_path).expect("stderr capture file should be created"),
+    );
+    let mut child = if explicit_file {
+        let path = directory.path().join("synthetic-config.json");
+        std::fs::write(&path, config).expect("synthetic config should be written");
+        spawn_proxy_with_file_config(&path, stderr)
+    } else {
+        spawn_proxy_with_stdin_config_and_stderr(config, stderr)
+    };
+
+    let status = child
+        .wait_for_exit(Duration::from_secs(3))
+        .expect("invalid config should fail promptly");
+    assert!(!status.success(), "invalid config must fail startup");
+    let stderr = std::fs::read_to_string(&stderr_path)
+        .expect("stderr capture file should be readable after child exit");
+    assert!(
+        stderr.contains("could not start AgencyProxy:"),
+        "startup diagnostic prefix should be preserved: {stderr}"
+    );
+    assert!(stderr.contains(expected_diagnostic), "stderr: {stderr}");
+    assert!(
+        !stderr.contains(marker),
+        "input marker leaked to stderr: {stderr}"
+    );
 }
 
 fn unused_loopback_address() -> std::net::SocketAddr {
@@ -221,16 +349,83 @@ fn websocket_rejects_clients_without_the_configured_key() {
         )
         .await
         .ok();
-        // `recv_raw` succeeds only for a JSON text frame, which is exactly the
-        // MCP response an unauthenticated client must not get. A close, a
-        // dropped connection or a control frame is an error here.
-        let closed = nagoya::timeout(Duration::from_secs(2), socket.recv_raw())
-            .await
-            .expect("unauthenticated connection should close promptly");
-        assert!(
-            closed.is_err(),
-            "unauthenticated client must not receive an MCP response"
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut rejection_received = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "unauthenticated connection should reject and close promptly"
+            );
+            match nagoya::timeout(remaining, socket.recv_raw()).await {
+                Err(_) => panic!("unauthenticated connection should reject and close promptly"),
+                Ok(Ok(rejection)) => {
+                    assert!(
+                        !rejection_received,
+                        "server sent a duplicate authentication rejection"
+                    );
+                    let fields = rejection
+                        .as_object()
+                        .expect("rejection must be a JSON object");
+                    assert_eq!(
+                        fields.len(),
+                        6,
+                        "unexpected authentication rejection envelope"
+                    );
+                    assert_eq!(rejection["type"], "Error");
+                    assert_eq!(rejection["method"], 0);
+                    assert_eq!(rejection["seq"], 0);
+                    assert_eq!(rejection["code"], 100400);
+                    assert!(rejection["log_id"].is_string());
+                    let params = rejection["params"]
+                        .as_object()
+                        .expect("authentication rejection params must be an object");
+                    assert_eq!(params.len(), 2);
+                    assert_eq!(rejection["params"]["kind"], "BadRequest");
+                    assert_eq!(
+                        rejection["params"]["message"],
+                        "AgencyProxy authentication failed"
+                    );
+                    assert!(rejection.get("jsonrpc").is_none());
+                    assert!(rejection.get("id").is_none());
+                    rejection_received = true;
+                }
+                Ok(Err(error)) => {
+                    let diagnostic = error.to_string();
+                    if diagnostic.ends_with("got ping") || diagnostic.ends_with("got pong") {
+                        // `recv_raw` reports control frames as errors after the
+                        // client has handled them. Keep waiting under one deadline.
+                        continue;
+                    }
+                    // The current client flattens transport errors into text.
+                    // Classify only OS connection teardown errors, not arbitrary
+                    // parse/protocol failures, after the rejection envelope.
+                    let reset = diagnostic
+                        .strip_prefix("websocket read failed: io: errno ")
+                        .and_then(|code| code.parse::<i32>().ok())
+                        .is_some_and(|code| {
+                            matches!(
+                                std::io::Error::from_raw_os_error(code).kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            )
+                        });
+                    let terminal = reset
+                        || diagnostic == "Connection closed"
+                        || diagnostic.ends_with("got close")
+                        || diagnostic == "websocket read failed: closed without a handshake";
+                    assert!(
+                        terminal,
+                        "unexpected WebSocket receive failure before termination"
+                    );
+                    assert!(
+                        rejection_received,
+                        "connection terminated before the authentication rejection"
+                    );
+                    break;
+                }
+            }
+        }
         task.cancel();
     });
 }
@@ -250,16 +445,23 @@ fn release_cli_starts_the_configured_websocket_transport() {
             }
         })
         .to_string();
-        let mut child = spawn_proxy_with_config(config);
+        let dir = tempdir().expect("temporary config directory should exist");
+        let config_path = dir.path().join("websocket-config.json");
+        std::fs::write(&config_path, config).expect("explicit config should be written");
+        let mut child = spawn_proxy_with_file_config(&config_path, Stdio::null());
 
         let mut socket = None;
-        for _ in 0..100 {
-            if let Ok(connected) = connect(address, true, &handle).await {
+        let startup_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < startup_deadline {
+            if let Ok(Ok(connected)) =
+                nagoya::timeout(Duration::from_millis(250), connect(address, true, &handle)).await
+            {
                 socket = Some(connected);
                 break;
             }
             assert!(
                 child
+                    .child
                     .try_wait()
                     .expect("child status should be readable")
                     .is_none(),
@@ -286,9 +488,54 @@ fn release_cli_starts_the_configured_websocket_transport() {
         let initialized = receive_json(&mut socket).await;
         assert_eq!(initialized["result"]["serverInfo"]["name"], "agency-proxy");
 
-        child.kill().expect("test proxy should stop");
-        child.wait().expect("test proxy should be reaped");
+        child.child.kill().expect("test proxy should stop");
+        child
+            .wait_for_exit(Duration::from_secs(3))
+            .expect("test proxy should be reaped promptly");
     });
+}
+
+#[test]
+fn cli_config_errors_redact_input() {
+    let type_marker = "synthetic-unknown-type-marker";
+    let unknown_type = json!({"connection": {"type": type_marker}}).to_string();
+    assert_cli_config_error_is_redacted(
+        &unknown_type,
+        type_marker,
+        "invalid config JSON (data error at line",
+        false,
+    );
+
+    let field_marker = "synthetic-unknown-field-marker";
+    let mut connection = json!({"type": "unix", "socket": "synthetic-socket"});
+    connection
+        .as_object_mut()
+        .expect("connection should be an object")
+        .insert(field_marker.into(), json!("synthetic-field-value-marker"));
+    let unknown_field = json!({"connection": connection}).to_string();
+    assert_cli_config_error_is_redacted(
+        &unknown_field,
+        field_marker,
+        "invalid config JSON (data error at line",
+        true,
+    );
+
+    let origin_marker = "synthetic-invalid-origin-marker";
+    let invalid_origin = json!({
+        "connection": {
+            "type": "web_socket",
+            "address": "127.0.0.1:0",
+            "authenticationKey": KEY,
+            "allowedOrigins": [origin_marker]
+        }
+    })
+    .to_string();
+    assert_cli_config_error_is_redacted(
+        &invalid_origin,
+        origin_marker,
+        "allowed WebSocket origins must begin with http:// or https://",
+        false,
+    );
 }
 
 #[cfg(unix)]
@@ -324,8 +571,11 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         let mut child = spawn_proxy_with_config(config);
 
         let mut socket = None;
-        for _ in 0..100 {
-            if let Ok(connected) = connect(address, true, &handle).await {
+        let startup_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < startup_deadline {
+            if let Ok(Ok(connected)) =
+                nagoya::timeout(Duration::from_millis(250), connect(address, true, &handle)).await
+            {
                 socket = Some(connected);
                 break;
             }
@@ -391,13 +641,14 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         let started = receive_json(&mut socket).await;
         assert_eq!(started["result"]["isError"], false);
 
-        // SAFETY: `child.id()` is the dedicated AgencyProxy process created by
+        // SAFETY: `child.child.id()` is the dedicated AgencyProxy process created by
         // this test, and SIGTERM is the behavior under test.
-        let sent = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        let sent = unsafe { libc::kill(child.child.id() as i32, libc::SIGTERM) };
         assert_eq!(sent, 0, "SIGTERM should reach the test proxy");
         nagoya::sleep(Duration::from_millis(100)).await;
         assert!(
             child
+                .child
                 .try_wait()
                 .expect("child status should be readable")
                 .is_none(),
@@ -407,6 +658,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if child
+                .child
                 .try_wait()
                 .expect("child status should be readable")
                 .is_some()
