@@ -36,8 +36,6 @@ pub enum ConfigError {
     Read(#[source] std::io::Error),
     #[error("could not parse AgencyProxy config: {0}")]
     Parse(#[source] serde_json::Error),
-    #[error("AgencyProxy stdin config exceeds the {MAX_STDIN_CONFIG_BYTES}-byte limit")]
-    StdinTooLarge,
     #[error("WebSocket address must be loopback, got {0}")]
     NonLoopback(SocketAddr),
     #[error(
@@ -106,7 +104,10 @@ fn read_stdin(mut input: impl std::io::Read) -> Result<Vec<u8>, ConfigError> {
         .read_to_end(&mut bytes)
         .map_err(ConfigError::Read)?;
     if bytes.len() > MAX_STDIN_CONFIG_BYTES {
-        return Err(ConfigError::StdinTooLarge);
+        return Err(ConfigError::Read(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("AgencyProxy stdin config exceeds the {MAX_STDIN_CONFIG_BYTES}-byte limit"),
+        )));
     }
     Ok(bytes)
 }
@@ -153,7 +154,7 @@ mod tests {
         let oversized = std::io::Cursor::new(vec![b' '; MAX_STDIN_CONFIG_BYTES + 1]);
         assert!(matches!(
             read_stdin(oversized),
-            Err(ConfigError::StdinTooLarge)
+            Err(ConfigError::Read(error)) if error.kind() == std::io::ErrorKind::InvalidData
         ));
     }
 
