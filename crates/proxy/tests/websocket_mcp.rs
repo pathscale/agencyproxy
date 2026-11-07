@@ -43,9 +43,8 @@ impl ChildGuard {
 
 impl ChildGuard {
     fn terminate_and_reap(&mut self) -> std::io::Result<()> {
-        match self.child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) | Err(_) => {}
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return Ok(());
         }
 
         if let Err(kill_error) = self.child.kill() {
