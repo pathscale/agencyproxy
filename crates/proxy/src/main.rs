@@ -1,5 +1,6 @@
 use agency_proxy::{
-    ConnectionConfig, ProxyConfig, ProxyServer, RuntimeRegistry, WebSocketConfig, serve_websocket,
+    ConfigError, ConnectionConfig, ProxyConfig, ProxyServer, RuntimeRegistry, WebSocketConfig,
+    serve_websocket,
 };
 use clap::Parser;
 use futures::{channel::oneshot, future::select};
@@ -10,8 +11,8 @@ use std::{path::PathBuf, pin::pin, process::ExitCode};
 #[derive(Debug, Parser)]
 #[command(name = "agency-proxy", version, about)]
 struct Args {
-    /// JSON configuration selecting the proxy connection transport.
-    #[arg(long, value_name = "PATH", conflicts_with = "socket")]
+    /// JSON config file selecting the proxy transport, or `-` to read from stdin.
+    #[arg(long, value_name = "PATH|-", conflicts_with = "socket")]
     config: Option<PathBuf>,
     /// Compatibility shortcut for a permission-restricted Unix endpoint.
     #[arg(long, value_name = "PATH", required_unless_present = "config")]
@@ -26,14 +27,17 @@ struct Args {
 /// `termination`); then the reactor, whose own thread therefore inherits the
 /// signal block; then serving. `nagoya::block_on` drives each future on this
 /// thread and starts no thread of its own, and reading the config is a plain
-/// file read, so nothing before `termination` creates one either.
+/// file or stdin read, so nothing before `termination` creates one either.
 fn main() -> ExitCode {
     let args = Args::parse();
     let config = match args.config {
         Some(path) => match nagoya::block_on(ProxyConfig::read(&path)) {
             Ok(config) => config,
             Err(error) => {
-                eprintln!("could not start AgencyProxy: {error}");
+                eprintln!(
+                    "could not start AgencyProxy: {}",
+                    config_error_message(error)
+                );
                 return ExitCode::FAILURE;
             }
         },
@@ -72,6 +76,30 @@ fn main() -> ExitCode {
             eprintln!("AgencyProxy stopped: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn config_error_message(error: ConfigError) -> String {
+    match error {
+        ConfigError::Parse(error) => {
+            let category = match error.classify() {
+                serde_json::error::Category::Io => "I/O",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "EOF",
+            };
+            let line = error.line();
+            let column = error.column();
+            if line > 0 && column > 0 {
+                format!("invalid config JSON ({category} error at line {line}, column {column})")
+            } else {
+                format!("invalid config JSON ({category} error)")
+            }
+        }
+        ConfigError::InvalidOrigin(_) => {
+            "allowed WebSocket origins must begin with http:// or https://".into()
+        }
+        error => error.to_string(),
     }
 }
 
