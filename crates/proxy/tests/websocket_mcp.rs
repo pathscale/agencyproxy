@@ -39,9 +39,7 @@ impl ChildGuard {
             thread::sleep(Duration::from_millis(10).min(remaining));
         }
     }
-}
 
-impl ChildGuard {
     fn terminate_and_reap(&mut self) -> std::io::Result<()> {
         if let Ok(Some(_)) = self.child.try_wait() {
             return Ok(());
@@ -74,22 +72,7 @@ impl Drop for ChildGuard {
 }
 
 fn spawn_proxy_with_config(config: String) -> ChildGuard {
-    let mut child = ChildGuard {
-        child: Command::new(env!("CARGO_BIN_EXE_agency-proxy"))
-            .arg("--config")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to start agency-proxy"),
-    };
-    let mut stdin = child.child.stdin.take().expect("stdin was not piped");
-    stdin
-        .write_all(config.as_bytes())
-        .expect("failed to send configuration");
-    drop(stdin);
-    child
+    spawn_proxy_with_stdin_config_and_stderr(&config, Stdio::null())
 }
 
 fn spawn_proxy_with_file_config(path: &Path, stderr: Stdio) -> ChildGuard {
